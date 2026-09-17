@@ -1,0 +1,63 @@
+// SPDX-License-Identifier: CC0-1.0
+
+#ifndef FLUXION_AUDIO_MIXER_STREAM_HPP
+#define FLUXION_AUDIO_MIXER_STREAM_HPP
+
+#include <cstdint>
+#include <vector>
+#include "Object.hpp"
+#include "Data.hpp"
+#include "Bus.hpp"
+
+namespace fluxion_audio
+{
+    // A clip being played: a position into its `Data`, and the bus it feeds.
+    class Stream: public Object
+    {
+        friend Bus;
+    public:
+        explicit Stream(Data& initData) noexcept:
+            data{initData}
+        {
+        }
+
+        ~Stream() override
+        {
+            if (output) output->removeInput(this);
+        }
+
+        Stream(const Stream&) = delete;
+        Stream& operator=(const Stream&) = delete;
+        Stream(Stream&&) = delete;
+        Stream& operator=(Stream&&) = delete;
+
+        auto& getData() const noexcept { return data; }
+
+        void setOutput(Bus* newOutput)
+        {
+            if (output) output->removeInput(this);
+            output = newOutput;
+            if (output) output->addInput(this);
+        }
+
+        auto isPlaying() const noexcept { return playing; }
+        void play() noexcept { playing = true; }
+
+        void stop(bool shouldReset)
+        {
+            playing = false;
+            if (shouldReset) reset();
+        }
+
+        virtual void reset() = 0;
+
+        virtual void generateSamples(std::uint32_t frames, std::vector<float>& samples) = 0;
+
+    protected:
+        Data& data;
+        Bus* output = nullptr;
+        bool playing = false;
+    };
+}
+
+#endif // FLUXION_AUDIO_MIXER_STREAM_HPP
