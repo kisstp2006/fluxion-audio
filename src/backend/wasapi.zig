@@ -223,7 +223,7 @@ const Wasapi = struct {
     state: std.atomic.Value(State),
 };
 
-pub fn open(gpa: Allocator, desc: types.DeviceDesc) backend.Error!struct { backend.Impl, *const backend.Vtable } {
+pub fn open(gpa: Allocator, desc: types.DeviceDesc) backend.Error!backend.Opened {
     const inner = try mixer_backend.open(gpa, desc);
 
     const self = try gpa.create(Wasapi);

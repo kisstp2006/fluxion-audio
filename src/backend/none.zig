@@ -22,7 +22,7 @@ const None = struct {
     gpa: Allocator,
 };
 
-pub fn open(gpa: Allocator, desc: types.DeviceDesc) backend.Error!struct { backend.Impl, *const backend.Vtable } {
+pub fn open(gpa: Allocator, desc: types.DeviceDesc) backend.Error!backend.Opened {
     _ = desc;
     const self = try gpa.create(None);
     self.* = .{ .gpa = gpa };

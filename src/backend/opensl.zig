@@ -25,7 +25,7 @@ const OpenSl = struct {
     output: *c.fx_audio_output,
 };
 
-pub fn open(gpa: Allocator, desc: types.DeviceDesc) backend.Error!struct { backend.Impl, *const backend.Vtable } {
+pub fn open(gpa: Allocator, desc: types.DeviceDesc) backend.Error!backend.Opened {
     const inner = try mixer_backend.open(gpa, desc);
     const mixer_handle = mixer_backend.handleOf(inner[0]);
 

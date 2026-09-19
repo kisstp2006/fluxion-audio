@@ -22,6 +22,9 @@ pub const Backend = enum {
     /// An OpenSL ES output mix, re-enqueued from its own callback. Android
     /// only.
     opensl,
+    /// A backend the caller supplied to `Device.initWith`, none of the ones
+    /// above. `Info.name` says which it is.
+    other,
 };
 
 pub const Error = error{
@@ -52,6 +55,10 @@ pub const DeviceDesc = struct {
 pub const Info = struct {
     backend: Backend,
     device_name: []const u8,
+    /// What the backend is called: `mixer`, `wasapi` and so on, or the name a
+    /// caller gave a backend of its own. `Device` fills it in, a backend need
+    /// not.
+    name: []const u8 = "",
 };
 
 /// How to read the bytes handed to `Device.loadClip`.

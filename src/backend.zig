@@ -4,8 +4,12 @@
 //!
 //! A backend is a vtable and an opaque pointer, chosen when the device is
 //! made and never looked at again by anything outside `Device`. Adding one -
-//! WASAPI, ALSA, OpenSL ES - is a new file under `backend/` that fills this
-//! table, and one more arm in `Device.init`. Nothing a program calls changes.
+//! WASAPI, ALSA, OpenSL ES - is a new file that fills this table and an `Opener`
+//! that says how to open it. `Device.initWith` takes any opener, so a backend
+//! does not have to live in this library and nothing has to be added to
+//! `Device`: the built-in ones are listed by `Device.opener`, and a program, or
+//! a registry it keeps, can hold openers of its own. Nothing a program calls
+//! changes.
 //!
 //! `native` is whatever the backend allocated for a clip or a voice; `Device`
 //! stores it behind a handle and hands it back on every call.
@@ -50,5 +54,22 @@ pub const Vtable = struct {
     mix: *const fn (Impl, channels: u32, sample_rate: u32, out: []f32) void,
 };
 
-/// A backend's constructor: what `Device.init` calls.
-pub const Open = *const fn (gpa: Allocator, desc: types.DeviceDesc) Error!struct { Impl, *const Vtable };
+/// What opening a backend gives back: its state, and its table.
+pub const Opened = struct { Impl, *const Vtable };
+
+/// A backend's constructor: what `Device.init` and `Device.initWith` call.
+pub const Open = *const fn (gpa: Allocator, desc: types.DeviceDesc) Error!Opened;
+
+/// A way to open a device on one backend.
+///
+/// It is plain data, so a program can keep them in a list, or a registry can
+/// hold one per name. `Device.opener` has the ones this build brings; a backend
+/// written elsewhere makes its own.
+pub const Opener = struct {
+    /// What it is called: "mixer", "wasapi", "coreaudio". Borrowed by every
+    /// device it opens, so it has to live as long as they do.
+    name: []const u8,
+    /// Which of the built-in backends this is, or `.other`.
+    tag: types.Backend = .other,
+    open: Open,
+};

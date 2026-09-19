@@ -34,6 +34,8 @@ pub const resources = @import("resources.zig");
 pub const Device = @import("Device.zig");
 
 pub const Backend = types.Backend;
+/// How to open a backend. See `backend.Opener` and `Device.initWith`.
+pub const Opener = backend.Opener;
 pub const Error = types.Error;
 pub const Info = types.Info;
 pub const DeviceDesc = types.DeviceDesc;

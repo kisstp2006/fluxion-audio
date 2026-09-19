@@ -38,7 +38,7 @@ const Submix = struct {
     gain_id: usize,
 };
 
-pub fn open(gpa: Allocator, desc: types.DeviceDesc) backend.Error!struct { backend.Impl, *const backend.Vtable } {
+pub fn open(gpa: Allocator, desc: types.DeviceDesc) backend.Error!backend.Opened {
     _ = desc;
     const handle = c.fx_audio_mixer_create() orelse return error.Failed;
     errdefer c.fx_audio_mixer_destroy(handle);

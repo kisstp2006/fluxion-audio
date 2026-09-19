@@ -44,6 +44,8 @@ gpa: Allocator,
 impl: backend.Impl,
 vtable: *const backend.Vtable,
 tag: types.Backend,
+/// From the opener; borrowed.
+name: []const u8,
 
 clips: resources.ClipTable = .empty,
 voices: resources.VoiceTable = .empty,
@@ -61,21 +63,38 @@ pub fn available() []const types.Backend {
         &.{ .none, .mixer };
 }
 
-pub fn init(gpa: Allocator, desc: types.DeviceDesc) Error!Device {
-    const opened = switch (desc.backend) {
-        .none => try none_backend.open(gpa, desc),
-        .mixer => try mixer_backend.open(gpa, desc),
-        .wasapi => if (builtin.os.tag == .windows) try wasapi_backend.open(gpa, desc) else return error.Unsupported,
-        .alsa => if (is_linux_desktop) try alsa_backend.open(gpa, desc) else return error.Unsupported,
-        .opensl => if (is_android) try opensl_backend.open(gpa, desc) else return error.Unsupported,
+/// How to open one of the backends this build brings, or null if it does not
+/// bring it: `.wasapi` off Windows, `.alsa` off desktop Linux, `.opensl` off
+/// Android, and `.other`, which is whatever a caller supplies.
+///
+/// A program that keeps its backends in a registry registers these by `name`.
+pub fn opener(which: types.Backend) ?backend.Opener {
+    return switch (which) {
+        .none => .{ .name = "none", .tag = .none, .open = none_backend.open },
+        .mixer => .{ .name = "mixer", .tag = .mixer, .open = mixer_backend.open },
+        .wasapi => if (builtin.os.tag == .windows) .{ .name = "wasapi", .tag = .wasapi, .open = wasapi_backend.open } else null,
+        .alsa => if (is_linux_desktop) .{ .name = "alsa", .tag = .alsa, .open = alsa_backend.open } else null,
+        .opensl => if (is_android) .{ .name = "opensl", .tag = .opensl, .open = opensl_backend.open } else null,
+        .other => null,
     };
+}
 
+/// Opens a device on the backend an opener describes: one of `opener`'s, or one
+/// the caller made. `desc.backend` is not looked at, the opener has already
+/// chosen. The opener's name is borrowed until `deinit`.
+pub fn initWith(gpa: Allocator, desc: types.DeviceDesc, how: backend.Opener) Error!Device {
+    const opened = try how.open(gpa, desc);
     return .{
         .gpa = gpa,
         .impl = opened[0],
         .vtable = opened[1],
-        .tag = desc.backend,
+        .tag = how.tag,
+        .name = how.name,
     };
+}
+
+pub fn init(gpa: Allocator, desc: types.DeviceDesc) Error!Device {
+    return initWith(gpa, desc, opener(desc.backend) orelse return error.Unsupported);
 }
 
 /// Stop everything still playing, unload everything still loaded, then the
@@ -96,12 +115,17 @@ pub fn deinit(self: *Device) void {
     self.* = undefined;
 }
 
+/// Which of the built-in backends this is, or `.other` for one that came from
+/// `initWith`. `info().name` says which in either case.
 pub fn backendTag(self: *const Device) types.Backend {
     return self.tag;
 }
 
 pub fn info(self: *const Device) types.Info {
-    return self.vtable.info(self.impl);
+    var answer = self.vtable.info(self.impl);
+    answer.backend = self.tag;
+    answer.name = self.name;
+    return answer;
 }
 
 pub fn loadClip(self: *Device, desc: types.ClipDesc) Error!types.Clip {
@@ -203,6 +227,57 @@ test "open and close on the none backend" {
     var device = try Device.init(testing.allocator, .{});
     defer device.deinit();
     try testing.expectEqual(types.Backend.none, device.backendTag());
+}
+
+test "every backend this build brings has an opener with its own name" {
+    for (available()) |tag| {
+        const how = opener(tag) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualStrings(@tagName(tag), how.name);
+        try testing.expectEqual(tag, how.tag);
+    }
+    // `other` is whatever a caller makes
+    try testing.expect(opener(.other) == null);
+    try testing.expectError(error.Unsupported, Device.init(testing.allocator, .{ .backend = .other }));
+}
+
+test "a built-in opener opens the same device as init does" {
+    var by_init = try Device.init(testing.allocator, .{ .backend = .mixer });
+    defer by_init.deinit();
+    var by_opener = try Device.initWith(testing.allocator, .{}, opener(.mixer).?);
+    defer by_opener.deinit();
+
+    try testing.expectEqual(by_init.backendTag(), by_opener.backendTag());
+    try testing.expectEqual(types.Backend.mixer, by_opener.backendTag());
+    try testing.expectEqualStrings("mixer", by_opener.info().name);
+    try testing.expectEqualStrings(by_init.info().device_name, by_opener.info().device_name);
+}
+
+test "initWith opens a backend the caller supplies, under its own name" {
+    const mine: backend.Opener = .{ .name = "mine", .open = none_backend.open };
+
+    var device = try Device.initWith(testing.allocator, .{}, mine);
+    defer device.deinit();
+
+    try testing.expectEqual(types.Backend.other, device.backendTag());
+    try testing.expectEqualStrings("mine", device.info().name);
+    try testing.expectEqual(types.Backend.other, device.info().backend);
+
+    // it is a working device, not a label
+    const clip = try device.loadClip(.{ .format = .pcm_s16, .bytes = &.{} });
+    const voice = try device.play(clip, .{});
+    device.stop(voice);
+    device.unloadClip(clip);
+    try testing.expectError(error.InvalidHandle, device.setVolume(voice, 0.5));
+}
+
+fn refuses(gpa: Allocator, desc: types.DeviceDesc) Error!backend.Opened {
+    _ = .{ gpa, desc };
+    return error.NoDevice;
+}
+
+test "an opener that refuses leaves nothing behind" {
+    const how: backend.Opener = .{ .name = "absent", .open = refuses };
+    try testing.expectError(error.NoDevice, Device.initWith(testing.allocator, .{}, how));
 }
 
 test "a clip and a voice are real, distinct handles" {

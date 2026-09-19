@@ -29,6 +29,19 @@ thread; and `alsa`/`opensl` (Linux and Android), each doing the same on
 their own platform. `zig build example-tone` plays a second of tone through
 it.
 
+**Choosing a backend without the enum.** `Device.init` picks from the backends
+above. A program that wants to decide some other way - by name, from a
+configuration file, from what a registry holds - uses openers:
+`Device.opener(tag)` returns the `Opener` of a built-in backend (its `name`
+and the function that opens it), or null if this build does not bring it, and
+`Device.initWith(gpa, desc, opener)` opens a device on any opener. `Device.init`
+is `initWith` on the opener it chose.
+
+A backend written elsewhere - Core Audio, say - fills `backend.Vtable` and
+makes an `Opener`; `initWith` takes it from anywhere, and the device reports
+it as `Backend.other`, with the opener's `name` in `info()`. A backend that
+lives here also gets a case in `Device.opener`.
+
 A clip is either bytes to decode (`loadClip`, PCM or Ogg Vorbis) or a
 waveform with nothing to decode at all (`loadOscillator`: sine, square,
 sawtooth or triangle, for a given length or forever).
