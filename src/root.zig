@@ -64,4 +64,5 @@ test {
     _ = wav;
     _ = @import("backend/none.zig");
     _ = @import("backend/mixer.zig");
+    if (@import("builtin").os.tag == .windows) _ = @import("backend/wasapi.zig");
 }

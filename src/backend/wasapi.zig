@@ -280,3 +280,26 @@ fn close(context: *anyopaque) void {
     self.thread.join();
     self.gpa.destroy(self);
 }
+
+// -------------------------------------------------------------------------
+// Tests - on this machine's sound card, when it has one
+// -------------------------------------------------------------------------
+
+const testing = std.testing;
+const Device = @import("../Device.zig");
+
+test "a voice on the sound card moves on with the clock, read from this thread" {
+    var device = Device.init(testing.allocator, .{ .backend = .wasapi }) catch return error.SkipZigTest;
+    defer device.deinit();
+    try testing.expectEqual(types.Backend.wasapi, device.info().backend);
+
+    // Silence, so nothing is heard.
+    const silence = [_]i16{0} ** 44100;
+    const clip = try device.loadClip(.{ .format = .pcm_s16, .bytes = std.mem.sliceAsBytes(&silence), .channels = 1 });
+    const voice = try device.play(clip, .{});
+    Sleep(300);
+    const status = device.status(voice);
+    try testing.expect(status.playing);
+    try testing.expect(status.position > 0.1 and status.position < 1);
+    device.stop(voice);
+}
