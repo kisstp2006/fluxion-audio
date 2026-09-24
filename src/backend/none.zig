@@ -44,6 +44,7 @@ const vtable: backend.Vtable = .{
     .setVoiceLooping = setVoiceLooping,
     .setVoicePaused = setVoicePaused,
     .seekVoice = seekVoice,
+    .setVoiceOutput = setVoiceOutput,
     .voiceStatus = voiceStatus,
     .createSubmix = createSubmix,
     .destroySubmix = destroySubmix,
@@ -133,6 +134,10 @@ fn setVoicePaused(impl: backend.Impl, native: backend.Native, paused: bool) void
 
 fn seekVoice(impl: backend.Impl, native: backend.Native, frame: u64) void {
     _ = .{ impl, native, frame };
+}
+
+fn setVoiceOutput(impl: backend.Impl, native: backend.Native, output: ?backend.Native) void {
+    _ = .{ impl, native, output };
 }
 
 /// Never playing: there is nothing behind a voice to play.

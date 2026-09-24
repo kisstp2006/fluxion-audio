@@ -95,6 +95,7 @@ const vtable: backend.Vtable = .{
     .setVoiceLooping = setVoiceLooping,
     .setVoicePaused = setVoicePaused,
     .seekVoice = seekVoice,
+    .setVoiceOutput = setVoiceOutput,
     .voiceStatus = voiceStatus,
     .createSubmix = createSubmix,
     .destroySubmix = destroySubmix,
@@ -294,6 +295,12 @@ fn seekVoice(impl: backend.Impl, native_voice: backend.Native, frame: u64) void 
     const voice = asVoice(native_voice);
     c.fx_audio_mixer_seek_stream(self.handle, voice.stream_id, frame);
     c.fx_audio_voice_state_expect(voice.state, c.fx_audio_voice_state_playing(voice.state), frame);
+}
+
+fn setVoiceOutput(impl: backend.Impl, native_voice: backend.Native, output: ?backend.Native) void {
+    const self = cast(impl);
+    const output_bus_id: usize = if (output) |o| asSubmix(o).bus_id else self.master_bus_id;
+    c.fx_audio_mixer_set_bus_output(self.handle, asVoice(native_voice).bus_id, output_bus_id);
 }
 
 fn voiceStatus(impl: backend.Impl, native_voice: backend.Native) backend.Status {
@@ -687,6 +694,27 @@ test "a voice at twice the speed plays its clip in half the time" {
     try device.setSpeed(voice, 0.5);
     device.mix(1, 44100, &out);
     try testing.expectApproxEqAbs(@as(f64, 40.0 / 44100.0), device.status(voice).position, 1e-9);
+}
+
+test "a playing voice is moved into a submix, and takes its volume from there" {
+    var device = try Device.init(testing.allocator, .{ .backend = .mixer });
+    defer device.deinit();
+
+    const quiet = try device.createSubmix(.{ .volume = 0.5 });
+    defer device.destroySubmix(quiet);
+    const clip = try monoClip(&device, &(.{16384} ** 4));
+    const voice = try device.play(clip, .{});
+    defer device.stop(voice);
+
+    var one: [1]f32 = undefined;
+    device.mix(1, 44100, &one);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), one[0], 0.001);
+    try device.setOutput(voice, quiet);
+    device.mix(1, 44100, &one);
+    try testing.expectApproxEqAbs(@as(f32, 0.25), one[0], 0.001);
+    try device.setOutput(voice, null);
+    device.mix(1, 44100, &one);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), one[0], 0.001);
 }
 
 test "an MP3 is decoded as it plays, without the encoder's silence" {

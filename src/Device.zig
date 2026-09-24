@@ -202,6 +202,16 @@ pub fn setLooping(self: *Device, voice: types.Voice, looping: bool) Error!void {
     self.vtable.setVoiceLooping(self.impl, entry.native, looping);
 }
 
+/// Into `output` - `null` for the master bus - from the next mix on.
+pub fn setOutput(self: *Device, voice: types.Voice, output: ?types.Submix) Error!void {
+    const entry = self.voices.get(voice) orelse return error.InvalidHandle;
+    const output_native = if (output) |submix|
+        (self.submixes.get(submix) orelse return error.InvalidHandle).native
+    else
+        null;
+    self.vtable.setVoiceOutput(self.impl, entry.native, output_native);
+}
+
 /// See `PlayDesc.speed`.
 pub fn setSpeed(self: *Device, voice: types.Voice, speed: f32) Error!void {
     const entry = self.voices.get(voice) orelse return error.InvalidHandle;

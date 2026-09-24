@@ -46,6 +46,8 @@ pub const Vtable = struct {
     setVoicePaused: *const fn (Impl, Native, bool) void,
     /// To `frame` of the clip.
     seekVoice: *const fn (Impl, Native, frame: u64) void,
+    /// Into another submix - `null` for the master bus - as it plays.
+    setVoiceOutput: *const fn (Impl, Native, output: ?Native) void,
     voiceStatus: *const fn (Impl, Native) Status,
 
     /// A bus of its own, feeding `output` (`null` for the master bus) -
