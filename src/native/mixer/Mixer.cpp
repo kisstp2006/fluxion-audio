@@ -79,13 +79,15 @@ namespace fluxion_audio
                     }
                     case Command::Type::initStream:
                     {
-                        const auto initStreamCommand = static_cast<const InitStreamCommand*>(command.get());
+                        const auto initStreamCommand = static_cast<InitStreamCommand*>(command.get());
 
                         if (initStreamCommand->streamId > objects.size())
                             objects.resize(initStreamCommand->streamId);
 
+                        // The stream takes the command's hold on its state.
                         const auto data = static_cast<Data*>(objects[initStreamCommand->dataId - 1].get());
-                        objects[initStreamCommand->streamId - 1] = data->createStream();
+                        objects[initStreamCommand->streamId - 1] = data->createStream(initStreamCommand->state);
+                        initStreamCommand->state = nullptr;
                         break;
                     }
                     case Command::Type::playStream:
@@ -140,6 +142,14 @@ namespace fluxion_audio
                         updateProcessorCommand->updateFunction(processor);
                         break;
                     }
+                    case Command::Type::updateStream:
+                    {
+                        const auto updateStreamCommand = static_cast<const UpdateStreamCommand*>(command.get());
+
+                        const auto stream = static_cast<Stream*>(objects[updateStreamCommand->streamId - 1].get());
+                        updateStreamCommand->updateFunction(stream);
+                        break;
+                    }
                     default:
                         throw Error{"Invalid command"};
                 }
@@ -160,12 +170,5 @@ namespace fluxion_audio
 
         for (auto& sample : samples)
             sample = std::clamp(sample, -1.0F, 1.0F);
-    }
-
-    bool Mixer::isStreamPlaying(ObjectId streamId) const
-    {
-        if (streamId == 0 || streamId > objects.size() || !objects[streamId - 1])
-            return false;
-        return static_cast<Stream*>(objects[streamId - 1].get())->isPlaying();
     }
 }

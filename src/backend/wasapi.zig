@@ -2,10 +2,11 @@
 
 //! The Windows output backend: WASAPI in shared mode, on its own thread.
 //!
-//! Every clip/voice call here just forwards to a wrapped `mixer` backend -
-//! this file's only job is turning what that backend mixes into what the
-//! sound card actually wants, on a thread of its own so a game thread
-//! calling `Device.play` is never the one keeping the speakers fed.
+//! It is the `mixer` backend with this attached as its `Output` - every
+//! clip/voice call is the mixer's. This file's only job is turning what the
+//! graph mixes into what the sound card actually wants, on a thread of its
+//! own so a game thread calling `Device.play` is never the one keeping the
+//! speakers fed.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -191,7 +192,7 @@ const Session = struct {
 
         const channels = self.mix_format.channels;
         const planar = scratch[0 .. @as(usize, available) * channels];
-        wasapi.inner_vtable.mix(wasapi.inner_impl, channels, self.mix_format.samples_per_sec, planar);
+        mixer_backend.pull(wasapi.mixer, channels, self.mix_format.samples_per_sec, planar);
 
         if (self.mix_format.bits_per_sample == 32) {
             const out: [*]f32 = @ptrCast(@alignCast(data.?));
@@ -216,41 +217,40 @@ const State = enum(u8) { starting, ready, failed };
 
 const Wasapi = struct {
     gpa: Allocator,
-    inner_impl: backend.Impl,
-    inner_vtable: *const backend.Vtable,
+    /// The graph this feeds from: the `mixer` backend's own state.
+    mixer: backend.Impl,
     thread: std.Thread,
     stop_flag: std.atomic.Value(bool),
     state: std.atomic.Value(State),
 };
 
 pub fn open(gpa: Allocator, desc: types.DeviceDesc) backend.Error!backend.Opened {
-    const inner = try mixer_backend.open(gpa, desc);
+    const opened = try mixer_backend.open(gpa, desc);
+    errdefer opened[1].deinit(opened[0]);
 
     const self = try gpa.create(Wasapi);
+    errdefer gpa.destroy(self);
     self.* = .{
         .gpa = gpa,
-        .inner_impl = inner[0],
-        .inner_vtable = inner[1],
+        .mixer = opened[0],
         .thread = undefined,
         .stop_flag = std.atomic.Value(bool).init(false),
         .state = std.atomic.Value(State).init(.starting),
     };
 
-    self.thread = std.Thread.spawn(.{}, renderThread, .{self}) catch {
-        inner[1].deinit(inner[0]);
-        gpa.destroy(self);
-        return error.Failed;
-    };
-
+    self.thread = std.Thread.spawn(.{}, renderThread, .{self}) catch return error.Failed;
     while (self.state.load(.acquire) == .starting) Sleep(1);
     if (self.state.load(.acquire) == .failed) {
         self.thread.join();
-        self.inner_vtable.deinit(self.inner_impl);
-        gpa.destroy(self);
         return error.NoDevice;
     }
 
-    return .{ self, &vtable };
+    mixer_backend.attach(opened[0], .{
+        .context = self,
+        .close = close,
+        .info = .{ .backend = .wasapi, .device_name = "WASAPI default render endpoint" },
+    });
+    return opened;
 }
 
 fn renderThread(self: *Wasapi) void {
@@ -274,114 +274,9 @@ fn renderThread(self: *Wasapi) void {
     }
 }
 
-const vtable: backend.Vtable = .{
-    .deinit = deinit,
-    .info = info,
-    .loadClip = loadClip,
-    .loadOscillator = loadOscillator,
-    .unloadClip = unloadClip,
-    .play = play,
-    .stopVoice = stopVoice,
-    .setVoiceVolume = setVoiceVolume,
-    .setVoicePan = setVoicePan,
-    .setVoicePitch = setVoicePitch,
-    .isVoicePlaying = isVoicePlaying,
-    .createSubmix = createSubmix,
-    .destroySubmix = destroySubmix,
-    .setSubmixVolume = setSubmixVolume,
-    .setSubmixOutput = setSubmixOutput,
-    .mix = mixUnused,
-};
-
-fn cast(impl: backend.Impl) *Wasapi {
-    return @ptrCast(@alignCast(impl));
-}
-
-fn deinit(impl: backend.Impl) void {
-    const self = cast(impl);
+fn close(context: *anyopaque) void {
+    const self: *Wasapi = @ptrCast(@alignCast(context));
     self.stop_flag.store(true, .release);
     self.thread.join();
-    self.inner_vtable.deinit(self.inner_impl);
     self.gpa.destroy(self);
-}
-
-fn info(impl: backend.Impl) types.Info {
-    _ = impl;
-    return .{ .backend = .wasapi, .device_name = "WASAPI default render endpoint" };
-}
-
-fn loadClip(impl: backend.Impl, desc: types.ClipDesc) backend.Error!backend.Native {
-    const self = cast(impl);
-    return self.inner_vtable.loadClip(self.inner_impl, desc);
-}
-
-fn loadOscillator(impl: backend.Impl, desc: types.OscillatorDesc) backend.Error!backend.Native {
-    const self = cast(impl);
-    return self.inner_vtable.loadOscillator(self.inner_impl, desc);
-}
-
-fn unloadClip(impl: backend.Impl, native: backend.Native) void {
-    const self = cast(impl);
-    self.inner_vtable.unloadClip(self.inner_impl, native);
-}
-
-fn play(impl: backend.Impl, clip: backend.Native, output: ?backend.Native, desc: types.PlayDesc) backend.Error!backend.Native {
-    const self = cast(impl);
-    return self.inner_vtable.play(self.inner_impl, clip, output, desc);
-}
-
-fn stopVoice(impl: backend.Impl, native: backend.Native) void {
-    const self = cast(impl);
-    self.inner_vtable.stopVoice(self.inner_impl, native);
-}
-
-fn setVoiceVolume(impl: backend.Impl, native: backend.Native, volume: f32) void {
-    const self = cast(impl);
-    self.inner_vtable.setVoiceVolume(self.inner_impl, native, volume);
-}
-
-fn setVoicePan(impl: backend.Impl, native: backend.Native, pan: f32) void {
-    const self = cast(impl);
-    self.inner_vtable.setVoicePan(self.inner_impl, native, pan);
-}
-
-fn setVoicePitch(impl: backend.Impl, native: backend.Native, pitch: f32) void {
-    const self = cast(impl);
-    self.inner_vtable.setVoicePitch(self.inner_impl, native, pitch);
-}
-
-fn createSubmix(impl: backend.Impl, output: ?backend.Native, volume: f32) backend.Error!backend.Native {
-    const self = cast(impl);
-    return self.inner_vtable.createSubmix(self.inner_impl, output, volume);
-}
-
-fn destroySubmix(impl: backend.Impl, native: backend.Native) void {
-    const self = cast(impl);
-    self.inner_vtable.destroySubmix(self.inner_impl, native);
-}
-
-fn setSubmixVolume(impl: backend.Impl, native: backend.Native, volume: f32) void {
-    const self = cast(impl);
-    self.inner_vtable.setSubmixVolume(self.inner_impl, native, volume);
-}
-
-fn setSubmixOutput(impl: backend.Impl, native: backend.Native, output: ?backend.Native) void {
-    const self = cast(impl);
-    self.inner_vtable.setSubmixOutput(self.inner_impl, native, output);
-}
-
-fn isVoicePlaying(impl: backend.Impl, native: backend.Native) bool {
-    const self = cast(impl);
-    return self.inner_vtable.isVoicePlaying(self.inner_impl, native);
-}
-
-/// There is no meaningful buffer for an external caller to pull here - the
-/// render thread already owns pulling from the wrapped `mixer` backend and
-/// pushing to the sound card. Called anyway, it leaves `out` untouched
-/// rather than racing that thread.
-fn mixUnused(impl: backend.Impl, channels: u32, sample_rate: u32, out: []f32) void {
-    _ = impl;
-    _ = channels;
-    _ = sample_rate;
-    _ = out;
 }

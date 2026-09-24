@@ -10,13 +10,18 @@
 //! it is.
 
 const ids = @import("fluxion_id");
+const types = @import("types.zig");
 
 pub const ClipEntry = struct {
     native: *anyopaque,
+    info: types.ClipInfo,
 };
 
 pub const VoiceEntry = struct {
     native: *anyopaque,
+    /// What it plays, and so the rate its frames are counted at.
+    clip: Clip,
+    sample_rate: u32,
 };
 
 pub const SubmixEntry = struct {

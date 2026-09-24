@@ -27,18 +27,26 @@ pub const Vtable = struct {
     deinit: *const fn (Impl) void,
     info: *const fn (Impl) types.Info,
 
-    loadClip: *const fn (Impl, types.ClipDesc) Error!Native,
-    loadOscillator: *const fn (Impl, types.OscillatorDesc) Error!Native,
+    /// Never `.wav`: `Device` reads a WAVE file itself and hands over its
+    /// samples as `.pcm_f32`.
+    loadClip: *const fn (Impl, types.ClipDesc) Error!Loaded,
+    loadOscillator: *const fn (Impl, types.OscillatorDesc) Error!Loaded,
     unloadClip: *const fn (Impl, Native) void,
 
     /// `output`, already resolved from `desc.output` - `null` for the
-    /// master bus, otherwise another submix's own `Native`.
-    play: *const fn (Impl, clip: Native, output: ?Native, types.PlayDesc) Error!Native,
+    /// master bus, otherwise another submix's own `Native` - and `start`,
+    /// `desc.start` in the clip's frames.
+    play: *const fn (Impl, clip: Native, output: ?Native, types.PlayDesc, start: u64) Error!Native,
     stopVoice: *const fn (Impl, Native) void,
     setVoiceVolume: *const fn (Impl, Native, f32) void,
     setVoicePan: *const fn (Impl, Native, f32) void,
     setVoicePitch: *const fn (Impl, Native, f32) void,
-    isVoicePlaying: *const fn (Impl, Native) bool,
+    setVoiceSpeed: *const fn (Impl, Native, f32) void,
+    setVoiceLooping: *const fn (Impl, Native, bool) void,
+    setVoicePaused: *const fn (Impl, Native, bool) void,
+    /// To `frame` of the clip.
+    seekVoice: *const fn (Impl, Native, frame: u64) void,
+    voiceStatus: *const fn (Impl, Native) Status,
 
     /// A bus of its own, feeding `output` (`null` for the master bus) -
     /// what a voice or another submix can be routed into instead of
@@ -52,6 +60,19 @@ pub const Vtable = struct {
     /// a real backend calls on its own output thread; what a test calls
     /// directly to check the graph without any sound device at all.
     mix: *const fn (Impl, channels: u32, sample_rate: u32, out: []f32) void,
+};
+
+/// A clip a backend has made, and what it is.
+pub const Loaded = struct {
+    native: Native,
+    info: types.ClipInfo = .{},
+};
+
+/// How a voice is doing, in its clip's frames.
+pub const Status = struct {
+    playing: bool = false,
+    frame: u64 = 0,
+    ends: u32 = 0,
 };
 
 /// What opening a backend gives back: its state, and its table.

@@ -36,7 +36,17 @@ namespace fluxion_audio
         void resample(std::uint32_t channels, std::uint32_t sourceFrames, const std::vector<float>& sourceSamples,
                      std::uint32_t frames, std::vector<float>& samples)
         {
-            if (sourceFrames != frames)
+            if (sourceFrames != frames && (sourceFrames < 2 || frames < 2))
+            {
+                // Too few on either side to lay one across the other: the
+                // last of the source held.
+                samples.assign(static_cast<std::size_t>(frames) * channels, 0.0F);
+                if (sourceFrames == 0) return;
+                for (std::uint32_t channel = 0; channel < channels; ++channel)
+                    std::fill_n(samples.begin() + static_cast<std::ptrdiff_t>(channel * frames), frames,
+                                sourceSamples[channel * sourceFrames + sourceFrames - 1]);
+            }
+            else if (sourceFrames != frames)
             {
                 const auto sourceIncrement = static_cast<float>(sourceFrames - 1) / static_cast<float>(frames - 1);
                 auto sourcePosition = 0.0F;
@@ -200,10 +210,10 @@ namespace fluxion_audio
                             case 2: // downmix 6 to 2
                                 for (std::uint32_t frame = 0; frame < frames; ++frame)
                                 {
-                                    samples[frame * channels + 0] = (sourceSamples[0 * frames + frame] +
+                                    samples[0 * frames + frame] = (sourceSamples[0 * frames + frame] +
                                                                      (sourceSamples[2 * frames + frame] +
                                                                       sourceSamples[4 * frames + frame]) * 0.7071F); // L = L + (C + SL) * 0.7071
-                                    samples[frame * channels + 1] = (sourceSamples[1 * frames + frame] +
+                                    samples[1 * frames + frame] = (sourceSamples[1 * frames + frame] +
                                                                      (sourceSamples[2 * frames + frame] +
                                                                       sourceSamples[5 * frames + frame]) * 0.7071F); // R = R + (C + SR) * 0.7071
                                 }
@@ -211,12 +221,12 @@ namespace fluxion_audio
                             case 4: // downmix 6 to 4
                                 for (std::uint32_t frame = 0; frame < frames; ++frame)
                                 {
-                                    samples[frame * channels + 0] = (sourceSamples[0 * frames + frame] +
+                                    samples[0 * frames + frame] = (sourceSamples[0 * frames + frame] +
                                                                      sourceSamples[2 * frames + frame] * 0.7071F); // L = L + C * 0.7071
-                                    samples[frame * channels + 1] = (sourceSamples[1 * frames + frame] +
+                                    samples[1 * frames + frame] = (sourceSamples[1 * frames + frame] +
                                                                      sourceSamples[2 * frames + frame] * 0.7071F); // R = R + C * 0.7071
-                                    samples[frame * channels + 2] = sourceSamples[4 * frames + frame]; // SL = SL
-                                    samples[frame * channels + 3] = sourceSamples[5 * frames + frame]; // SR = SR
+                                    samples[2 * frames + frame] = sourceSamples[4 * frames + frame]; // SL = SL
+                                    samples[3 * frames + frame] = sourceSamples[5 * frames + frame]; // SR = SR
                                 }
                                 break;
                         }
@@ -250,9 +260,16 @@ namespace fluxion_audio
                 const std::uint32_t sourceSampleRate = stream->getData().getSampleRate();
                 const std::uint32_t sourceChannels = stream->getData().getChannels();
 
-                if (sourceSampleRate != sampleRate)
+                // How many of the clip's frames these are: its rate against
+                // the output's, times the voice's speed, and what the last
+                // mix owed carried over, so a rate that is no whole number of
+                // frames a mix keeps its time.
+                const double exact = static_cast<double>(frames) * sourceSampleRate * stream->speed / sampleRate + stream->carry;
+                const auto sourceFrames = static_cast<std::uint32_t>(std::max(exact, 1.0));
+                stream->carry = std::clamp(exact - sourceFrames, -1.0, 1.0);
+
+                if (sourceFrames != frames)
                 {
-                    std::uint32_t sourceFrames = (frames * sourceSampleRate + sampleRate - 1) / sampleRate; // round up
                     stream->generateSamples(sourceFrames, resampleBuffer);
                     resample(sourceChannels, sourceFrames, resampleBuffer, frames, mixBuffer);
                 }

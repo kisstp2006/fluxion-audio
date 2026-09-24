@@ -42,30 +42,6 @@ namespace fluxion_audio
 {
     namespace
     {
-        class VorbisData;
-
-        class VorbisStream final: public Stream
-        {
-        public:
-            explicit VorbisStream(VorbisData& vorbisData);
-
-            ~VorbisStream() override
-            {
-                if (vorbisStream)
-                    stb_vorbis_close(vorbisStream);
-            }
-
-            void reset() override
-            {
-                stb_vorbis_seek_start(vorbisStream);
-            }
-
-            void generateSamples(std::uint32_t frames, std::vector<float>& samples) override;
-
-        private:
-            stb_vorbis* vorbisStream = nullptr;
-        };
-
         class VorbisData final: public Data
         {
         public:
@@ -81,61 +57,80 @@ namespace fluxion_audio
                 const stb_vorbis_info info = stb_vorbis_get_info(vorbisStream);
                 channels = static_cast<std::uint32_t>(info.channels);
                 sampleRate = info.sample_rate;
+                frames = stb_vorbis_stream_length_in_samples(vorbisStream);
 
                 stb_vorbis_close(vorbisStream);
             }
 
             auto& getEncoded() const noexcept { return encoded; }
 
-            std::unique_ptr<Stream> createStream() override
-            {
-                return std::make_unique<VorbisStream>(*this);
-            }
+            std::uint64_t getFrames() const noexcept override { return frames; }
+
+            std::unique_ptr<Stream> createStream(fx_audio_voice_state* state) override;
 
         private:
             std::vector<std::uint8_t> encoded;
+            std::uint64_t frames = 0;
         };
 
-        VorbisStream::VorbisStream(VorbisData& vorbisData):
-            Stream{vorbisData}
+        // Decoded as it plays, from the file's bytes in memory: a long piece
+        // of music is never all samples at once.
+        class VorbisStream final: public Stream
         {
-            vorbisStream = stb_vorbis_open_memory(vorbisData.getEncoded().data(),
-                                                  static_cast<int>(vorbisData.getEncoded().size()),
-                                                  nullptr, nullptr);
-        }
-
-        void VorbisStream::generateSamples(std::uint32_t frames, std::vector<float>& samples)
-        {
-            const auto channels = data.getChannels();
-            const auto neededSize = frames * channels;
-            samples.resize(neededSize);
-
-            int resultFrames = 0;
-
-            if (neededSize > 0)
+        public:
+            VorbisStream(VorbisData& vorbisData, fx_audio_voice_state* state):
+                Stream{vorbisData, state}
             {
-                if (vorbisStream->eof)
-                    reset();
-
-                std::vector<float*> channelData(channels);
-                for (std::uint32_t channel = 0; channel < channels; ++channel)
-                    channelData[channel] = &samples[channel * frames];
-
-                resultFrames = stb_vorbis_get_samples_float(vorbisStream,
-                                                            static_cast<int>(channels),
-                                                            channelData.data(),
-                                                            static_cast<int>(frames));
+                vorbisStream = stb_vorbis_open_memory(vorbisData.getEncoded().data(),
+                                                      static_cast<int>(vorbisData.getEncoded().size()),
+                                                      nullptr, nullptr);
             }
 
-            if (vorbisStream->eof)
+            ~VorbisStream() override
             {
-                playing = false;
-                reset();
+                if (vorbisStream)
+                    stb_vorbis_close(vorbisStream);
             }
 
-            for (std::uint32_t channel = 0; channel < channels; ++channel)
-                for (auto frame = static_cast<std::uint32_t>(resultFrames); frame < frames; ++frame)
-                    samples[channel * frames + frame] = 0.0F;
+        protected:
+            std::uint32_t read(float* samples, std::uint32_t stride, std::uint32_t offset, std::uint32_t count) override
+            {
+                if (!vorbisStream || count == 0) return 0;
+                const auto channels = data.getChannels();
+                channelData.resize(channels);
+                std::uint32_t got = 0;
+                // stb_vorbis hands out what one packet decodes to at a time.
+                while (got < count)
+                {
+                    for (std::uint32_t channel = 0; channel < channels; ++channel)
+                        channelData[channel] = samples + channel * stride + offset + got;
+                    const int read = stb_vorbis_get_samples_float(vorbisStream,
+                                                                  static_cast<int>(channels),
+                                                                  channelData.data(),
+                                                                  static_cast<int>(count - got));
+                    if (read <= 0) break;
+                    got += static_cast<std::uint32_t>(read);
+                }
+                return got;
+            }
+
+            void rewind(std::uint64_t frame) override
+            {
+                if (!vorbisStream) return;
+                if (frame == 0)
+                    stb_vorbis_seek_start(vorbisStream);
+                else
+                    stb_vorbis_seek(vorbisStream, static_cast<unsigned int>(frame));
+            }
+
+        private:
+            stb_vorbis* vorbisStream = nullptr;
+            std::vector<float*> channelData;
+        };
+
+        std::unique_ptr<Stream> VorbisData::createStream(fx_audio_voice_state* state)
+        {
+            return std::make_unique<VorbisStream>(*this, state);
         }
     }
 

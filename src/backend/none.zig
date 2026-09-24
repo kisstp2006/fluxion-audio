@@ -40,7 +40,11 @@ const vtable: backend.Vtable = .{
     .setVoiceVolume = setVoiceVolume,
     .setVoicePan = setVoicePan,
     .setVoicePitch = setVoicePitch,
-    .isVoicePlaying = isVoicePlaying,
+    .setVoiceSpeed = setVoiceSpeed,
+    .setVoiceLooping = setVoiceLooping,
+    .setVoicePaused = setVoicePaused,
+    .seekVoice = seekVoice,
+    .voiceStatus = voiceStatus,
     .createSubmix = createSubmix,
     .destroySubmix = destroySubmix,
     .setSubmixVolume = setSubmixVolume,
@@ -67,24 +71,29 @@ fn info(impl: backend.Impl) types.Info {
 // rather than of a handle that was never backed by anything.
 const Placeholder = struct {};
 
-fn loadClip(impl: backend.Impl, desc: types.ClipDesc) backend.Error!backend.Native {
-    _ = desc;
-    return @ptrCast(try cast(impl).gpa.create(Placeholder));
+/// Nothing is decoded: what a raw clip is is known from its desc, and an
+/// encoded one says nothing.
+fn loadClip(impl: backend.Impl, desc: types.ClipDesc) backend.Error!backend.Loaded {
+    const native: backend.Native = @ptrCast(try cast(impl).gpa.create(Placeholder));
+    const frames: u64 = switch (desc.format) {
+        .pcm_s16 => if (desc.channels == 0) 0 else desc.bytes.len / 2 / desc.channels,
+        .pcm_f32 => if (desc.channels == 0) 0 else desc.samples.len / desc.channels,
+        .wav, .vorbis, .mp3 => return .{ .native = native },
+    };
+    return .{ .native = native, .info = .{ .channels = desc.channels, .sample_rate = desc.sample_rate, .frames = frames } };
 }
 
-fn loadOscillator(impl: backend.Impl, desc: types.OscillatorDesc) backend.Error!backend.Native {
-    _ = desc;
-    return @ptrCast(try cast(impl).gpa.create(Placeholder));
+fn loadOscillator(impl: backend.Impl, desc: types.OscillatorDesc) backend.Error!backend.Loaded {
+    const native: backend.Native = @ptrCast(try cast(impl).gpa.create(Placeholder));
+    return .{ .native = native, .info = .{ .channels = 1, .sample_rate = desc.sample_rate, .frames = types.oscillatorFrames(desc) } };
 }
 
 fn unloadClip(impl: backend.Impl, native: backend.Native) void {
     cast(impl).gpa.destroy(@as(*Placeholder, @ptrCast(@alignCast(native))));
 }
 
-fn play(impl: backend.Impl, clip: backend.Native, output: ?backend.Native, desc: types.PlayDesc) backend.Error!backend.Native {
-    _ = clip;
-    _ = output;
-    _ = desc;
+fn play(impl: backend.Impl, clip: backend.Native, output: ?backend.Native, desc: types.PlayDesc, start: u64) backend.Error!backend.Native {
+    _ = .{ clip, output, desc, start };
     return @ptrCast(try cast(impl).gpa.create(Placeholder));
 }
 
@@ -110,10 +119,26 @@ fn setVoicePitch(impl: backend.Impl, native: backend.Native, pitch: f32) void {
     _ = pitch;
 }
 
-fn isVoicePlaying(impl: backend.Impl, native: backend.Native) bool {
-    _ = impl;
-    _ = native;
-    return false;
+fn setVoiceSpeed(impl: backend.Impl, native: backend.Native, speed: f32) void {
+    _ = .{ impl, native, speed };
+}
+
+fn setVoiceLooping(impl: backend.Impl, native: backend.Native, looping: bool) void {
+    _ = .{ impl, native, looping };
+}
+
+fn setVoicePaused(impl: backend.Impl, native: backend.Native, paused: bool) void {
+    _ = .{ impl, native, paused };
+}
+
+fn seekVoice(impl: backend.Impl, native: backend.Native, frame: u64) void {
+    _ = .{ impl, native, frame };
+}
+
+/// Never playing: there is nothing behind a voice to play.
+fn voiceStatus(impl: backend.Impl, native: backend.Native) backend.Status {
+    _ = .{ impl, native };
+    return .{};
 }
 
 fn createSubmix(impl: backend.Impl, output: ?backend.Native, volume: f32) backend.Error!backend.Native {

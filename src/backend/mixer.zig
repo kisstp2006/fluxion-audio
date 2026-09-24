@@ -2,9 +2,12 @@
 
 //! The vendored mixer graph, wired up so a clip is a `Data`, a voice is a
 //! `Stream` feeding its own bus (with a gain, a pan and a pitch-shift
-//! processor on it) into the master bus. `Device.mix` pulls the result;
-//! nothing here writes to a sound device - that is the next backend, on top
-//! of this one.
+//! processor on it) into the master bus. `Device.mix` pulls the result.
+//!
+//! On its own it writes to no sound device. The output backends - `wasapi`,
+//! `alsa`, `opensl` - are this graph with an `Output` attached: the thread
+//! of their own that pulls from it and feeds the sound card, closed before
+//! the graph goes. Every other call is this file's.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -14,21 +17,32 @@ const backend = @import("../backend.zig");
 const native = @import("../native.zig");
 const c = native.c;
 
+/// A sound device fed from the graph on a thread of its own.
+pub const Output = struct {
+    context: *anyopaque,
+    /// Stops the thread and lets the device go.
+    close: *const fn (context: *anyopaque) void,
+    info: types.Info,
+};
+
 const Mixer = struct {
     gpa: Allocator,
     handle: *c.fx_audio_mixer,
     master_bus_id: usize,
+    output: ?Output = null,
 };
 
 /// The five graph objects behind one playing voice: a stream reading the
 /// clip, a private bus so the voice has somewhere to hang its own gain, pan
-/// and pitch-shift, and those three processors.
+/// and pitch-shift, and those three processors - and what the stream says
+/// of itself as it plays.
 const Voice = struct {
     stream_id: usize,
     bus_id: usize,
     gain_id: usize,
     pan_id: usize,
     pitch_id: usize,
+    state: *c.fx_audio_voice_state,
 };
 
 /// A submix: a bus of its own with a gain processor for its volume, feeding
@@ -52,6 +66,20 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) backend.Error!backend.Opened
     return .{ self, &vtable };
 }
 
+/// Hand the graph `impl` - one `open` returned - to a sound device's thread:
+/// from here `Device.mix` leaves its buffer alone, and the device is closed
+/// with the graph.
+pub fn attach(impl: backend.Impl, output: Output) void {
+    cast(impl).output = output;
+}
+
+/// Mix into `out` for a sound device: what an `Output`'s thread calls.
+pub fn pull(impl: backend.Impl, channels: u32, sample_rate: u32, out: []f32) void {
+    const self = cast(impl);
+    const frames: u32 = @intCast(out.len / channels);
+    c.fx_audio_mixer_get_samples(self.handle, frames, channels, sample_rate, out.ptr);
+}
+
 const vtable: backend.Vtable = .{
     .deinit = deinit,
     .info = info,
@@ -63,7 +91,11 @@ const vtable: backend.Vtable = .{
     .setVoiceVolume = setVoiceVolume,
     .setVoicePan = setVoicePan,
     .setVoicePitch = setVoicePitch,
-    .isVoicePlaying = isVoicePlaying,
+    .setVoiceSpeed = setVoiceSpeed,
+    .setVoiceLooping = setVoiceLooping,
+    .setVoicePaused = setVoicePaused,
+    .seekVoice = seekVoice,
+    .voiceStatus = voiceStatus,
     .createSubmix = createSubmix,
     .destroySubmix = destroySubmix,
     .setSubmixVolume = setSubmixVolume,
@@ -84,16 +116,19 @@ pub fn handleOf(impl: backend.Impl) *c.fx_audio_mixer {
 
 fn deinit(impl: backend.Impl) void {
     const self = cast(impl);
+    // The device's thread reads the graph: it stops first.
+    if (self.output) |output| output.close(output.context);
     c.fx_audio_mixer_destroy(self.handle);
     self.gpa.destroy(self);
 }
 
 fn info(impl: backend.Impl) types.Info {
-    _ = impl;
+    const self = cast(impl);
+    if (self.output) |output| return output.info;
     return .{ .backend = .mixer, .device_name = "mixer graph, no sound device" };
 }
 
-fn loadClip(impl: backend.Impl, desc: types.ClipDesc) backend.Error!backend.Native {
+fn loadClip(impl: backend.Impl, desc: types.ClipDesc) backend.Error!backend.Loaded {
     const self = cast(impl);
     const data_id = c.fx_audio_mixer_next_id(self.handle);
 
@@ -118,25 +153,28 @@ fn loadClip(impl: backend.Impl, desc: types.ClipDesc) backend.Error!backend.Nati
                 }
             }
 
-            c.fx_audio_mixer_init_data_pcm_f32(
-                self.handle,
-                data_id,
-                @intCast(channels),
-                desc.sample_rate,
-                planar.ptr,
-                frame_count,
-            );
+            c.fx_audio_mixer_init_data_pcm_f32(self.handle, data_id, @intCast(channels), desc.sample_rate, planar.ptr, frame_count);
+            return .{ .native = @ptrFromInt(data_id), .info = .{ .channels = channels, .sample_rate = desc.sample_rate, .frames = frame_count } };
         },
-        .vorbis => {
-            const failed = c.fx_audio_mixer_init_data_vorbis(self.handle, data_id, desc.bytes.ptr, desc.bytes.len);
+        .pcm_f32 => {
+            const frame_count = desc.samples.len / desc.channels;
+            c.fx_audio_mixer_init_data_pcm_f32(self.handle, data_id, @intCast(desc.channels), desc.sample_rate, desc.samples.ptr, frame_count);
+            return .{ .native = @ptrFromInt(data_id), .info = .{ .channels = desc.channels, .sample_rate = desc.sample_rate, .frames = frame_count } };
+        },
+        .vorbis, .mp3 => {
+            var said: c.fx_audio_clip_info = undefined;
+            const failed = if (desc.format == .vorbis)
+                c.fx_audio_mixer_init_data_vorbis(self.handle, data_id, desc.bytes.ptr, desc.bytes.len, &said)
+            else
+                c.fx_audio_mixer_init_data_mp3(self.handle, data_id, desc.bytes.ptr, desc.bytes.len, &said);
             if (failed != 0) return error.DecodeFailed;
+            return .{ .native = @ptrFromInt(data_id), .info = .{ .channels = said.channels, .sample_rate = said.sample_rate, .frames = said.frames } };
         },
+        .wav => unreachable,
     }
-
-    return @ptrFromInt(data_id);
 }
 
-fn loadOscillator(impl: backend.Impl, desc: types.OscillatorDesc) backend.Error!backend.Native {
+fn loadOscillator(impl: backend.Impl, desc: types.OscillatorDesc) backend.Error!backend.Loaded {
     const self = cast(impl);
     const data_id = c.fx_audio_mixer_next_id(self.handle);
 
@@ -156,7 +194,7 @@ fn loadOscillator(impl: backend.Impl, desc: types.OscillatorDesc) backend.Error!
         desc.sample_rate,
     );
 
-    return @ptrFromInt(data_id);
+    return .{ .native = @ptrFromInt(data_id), .info = .{ .channels = 1, .sample_rate = desc.sample_rate, .frames = types.oscillatorFrames(desc) } };
 }
 
 fn unloadClip(impl: backend.Impl, native_clip: backend.Native) void {
@@ -164,7 +202,7 @@ fn unloadClip(impl: backend.Impl, native_clip: backend.Native) void {
     c.fx_audio_mixer_delete_object(self.handle, @intFromPtr(native_clip));
 }
 
-fn play(impl: backend.Impl, clip: backend.Native, output: ?backend.Native, desc: types.PlayDesc) backend.Error!backend.Native {
+fn play(impl: backend.Impl, clip: backend.Native, output: ?backend.Native, desc: types.PlayDesc, start: u64) backend.Error!backend.Native {
     const self = cast(impl);
     const data_id = @intFromPtr(clip);
     const output_bus_id: usize = if (output) |o| asSubmix(o).bus_id else self.master_bus_id;
@@ -173,7 +211,7 @@ fn play(impl: backend.Impl, clip: backend.Native, output: ?backend.Native, desc:
     errdefer self.gpa.destroy(voice);
 
     voice.stream_id = c.fx_audio_mixer_next_id(self.handle);
-    c.fx_audio_mixer_init_stream(self.handle, voice.stream_id, data_id);
+    voice.state = c.fx_audio_mixer_init_stream(self.handle, voice.stream_id, data_id) orelse return error.OutOfMemory;
 
     voice.bus_id = c.fx_audio_mixer_next_id(self.handle);
     c.fx_audio_mixer_init_bus(self.handle, voice.bus_id);
@@ -192,7 +230,11 @@ fn play(impl: backend.Impl, clip: backend.Native, output: ?backend.Native, desc:
     c.fx_audio_mixer_init_pitch_shift(self.handle, voice.pitch_id, desc.pitch);
     c.fx_audio_mixer_add_processor(self.handle, voice.bus_id, voice.pitch_id);
 
-    c.fx_audio_mixer_play_stream(self.handle, voice.stream_id);
+    if (desc.loop) c.fx_audio_mixer_set_stream_looping(self.handle, voice.stream_id, 1);
+    if (desc.speed != 1) c.fx_audio_mixer_set_stream_speed(self.handle, voice.stream_id, @max(desc.speed, 0.01));
+    if (start > 0) c.fx_audio_mixer_seek_stream(self.handle, voice.stream_id, start);
+    if (!desc.paused) c.fx_audio_mixer_play_stream(self.handle, voice.stream_id);
+    c.fx_audio_voice_state_expect(voice.state, @intFromBool(!desc.paused), start);
 
     return voice;
 }
@@ -209,6 +251,7 @@ fn stopVoice(impl: backend.Impl, native_voice: backend.Native) void {
     c.fx_audio_mixer_delete_object(self.handle, voice.gain_id);
     c.fx_audio_mixer_delete_object(self.handle, voice.bus_id);
     c.fx_audio_mixer_delete_object(self.handle, voice.stream_id);
+    c.fx_audio_voice_state_release(voice.state);
     self.gpa.destroy(voice);
 }
 
@@ -227,9 +270,40 @@ fn setVoicePitch(impl: backend.Impl, native_voice: backend.Native, pitch: f32) v
     c.fx_audio_mixer_set_pitch_shift(self.handle, asVoice(native_voice).pitch_id, pitch);
 }
 
-fn isVoicePlaying(impl: backend.Impl, native_voice: backend.Native) bool {
+fn setVoiceSpeed(impl: backend.Impl, native_voice: backend.Native, speed: f32) void {
     const self = cast(impl);
-    return c.fx_audio_mixer_is_stream_playing(self.handle, asVoice(native_voice).stream_id) != 0;
+    c.fx_audio_mixer_set_stream_speed(self.handle, asVoice(native_voice).stream_id, speed);
+}
+
+fn setVoiceLooping(impl: backend.Impl, native_voice: backend.Native, looping: bool) void {
+    const self = cast(impl);
+    c.fx_audio_mixer_set_stream_looping(self.handle, asVoice(native_voice).stream_id, @intFromBool(looping));
+}
+
+fn setVoicePaused(impl: backend.Impl, native_voice: backend.Native, paused: bool) void {
+    const self = cast(impl);
+    const voice = asVoice(native_voice);
+    if (paused) {
+        c.fx_audio_mixer_stop_stream(self.handle, voice.stream_id, 0);
+    } else c.fx_audio_mixer_play_stream(self.handle, voice.stream_id);
+    c.fx_audio_voice_state_expect(voice.state, @intFromBool(!paused), c.fx_audio_voice_state_frame(voice.state));
+}
+
+fn seekVoice(impl: backend.Impl, native_voice: backend.Native, frame: u64) void {
+    const self = cast(impl);
+    const voice = asVoice(native_voice);
+    c.fx_audio_mixer_seek_stream(self.handle, voice.stream_id, frame);
+    c.fx_audio_voice_state_expect(voice.state, c.fx_audio_voice_state_playing(voice.state), frame);
+}
+
+fn voiceStatus(impl: backend.Impl, native_voice: backend.Native) backend.Status {
+    _ = impl;
+    const state = asVoice(native_voice).state;
+    return .{
+        .playing = c.fx_audio_voice_state_playing(state) != 0,
+        .frame = c.fx_audio_voice_state_frame(state),
+        .ends = c.fx_audio_voice_state_ends(state),
+    };
 }
 
 fn asSubmix(native_submix: backend.Native) *Submix {
@@ -273,10 +347,11 @@ fn setSubmixOutput(impl: backend.Impl, native_submix: backend.Native, output: ?b
     c.fx_audio_mixer_set_bus_output(self.handle, asSubmix(native_submix).bus_id, output_bus_id);
 }
 
+/// With a sound device attached, its thread is the one that pulls, and
+/// `out` is left as it is rather than racing it.
 fn mix(impl: backend.Impl, channels: u32, sample_rate: u32, out: []f32) void {
-    const self = cast(impl);
-    const frames: u32 = @intCast(out.len / channels);
-    c.fx_audio_mixer_get_samples(self.handle, frames, channels, sample_rate, out.ptr);
+    if (cast(impl).output != null) return;
+    pull(impl, channels, sample_rate, out);
 }
 
 // -------------------------------------------------------------------------
@@ -501,13 +576,151 @@ test "an oscillator with a length finishes on its own" {
         .frequency = 100,
         .length = 1.0 / 44100.0, // exactly one frame
     });
+    try testing.expectEqual(@as(u64, 1), device.clipInfo(clip).?.frames);
+    const voice = try device.play(clip, .{});
+    defer device.stop(voice);
+
+    // Its one frame played, it has ended - with the mix that played it.
+    var one: [1]f32 = undefined;
+    device.mix(1, 44100, &one);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), @abs(one[0]), 0.001);
+    try testing.expect(!device.isPlaying(voice));
+    try testing.expectEqual(@as(u32, 1), device.status(voice).ends);
+}
+
+/// A mono clip of `samples`, at 44100.
+fn monoClip(device: *Device, samples: []const i16) !types.Clip {
+    return device.loadClip(.{ .format = .pcm_s16, .bytes = std.mem.sliceAsBytes(samples), .channels = 1 });
+}
+
+test "a looping voice goes round without a gap, and never ends" {
+    var device = try Device.init(testing.allocator, .{ .backend = .mixer });
+    defer device.deinit();
+
+    const clip = try monoClip(&device, &.{ 8192, 16384, 24576 });
+    const voice = try device.play(clip, .{ .loop = true });
+    defer device.stop(voice);
+
+    var out: [7]f32 = undefined;
+    device.mix(1, 44100, &out);
+    const want = [_]f32{ 0.25, 0.5, 0.75, 0.25, 0.5, 0.75, 0.25 };
+    for (want, out) |expected, got| try testing.expectApproxEqAbs(expected, got, 0.001);
+    const status = device.status(voice);
+    try testing.expect(status.playing);
+    try testing.expectEqual(@as(u32, 0), status.ends);
+    try testing.expectApproxEqAbs(@as(f64, 1.0 / 44100.0), status.position, 1e-9);
+}
+
+test "a voice that plays out says it ended, and where a voice is is read from any thread" {
+    var device = try Device.init(testing.allocator, .{ .backend = .mixer });
+    defer device.deinit();
+
+    const clip = try monoClip(&device, &.{ 16384, 16384, 16384 });
+    const voice = try device.play(clip, .{});
+    defer device.stop(voice);
+    // Said at once, before a mix has run the play.
+    try testing.expect(device.status(voice).playing);
+
+    var out: [2]f32 = undefined;
+    device.mix(1, 44100, &out);
+    try testing.expectApproxEqAbs(@as(f64, 2.0 / 44100.0), device.status(voice).position, 1e-9);
+    device.mix(1, 44100, &out);
+    const status = device.status(voice);
+    try testing.expect(!status.playing);
+    try testing.expectEqual(@as(u32, 1), status.ends);
+    try testing.expectApproxEqAbs(@as(f32, 0), out[1], 0.001);
+}
+
+test "a paused voice holds its place, and goes on from it" {
+    var device = try Device.init(testing.allocator, .{ .backend = .mixer });
+    defer device.deinit();
+
+    const clip = try monoClip(&device, &.{ 8192, 16384, 24576, 32767 });
     const voice = try device.play(clip, .{});
     defer device.stop(voice);
 
     var one: [1]f32 = undefined;
     device.mix(1, 44100, &one);
-    try testing.expect(device.isPlaying(voice));
-
-    device.mix(1, 44100, &one);
+    try testing.expectApproxEqAbs(@as(f32, 0.25), one[0], 0.001);
+    try device.setPaused(voice, true);
     try testing.expect(!device.isPlaying(voice));
+    device.mix(1, 44100, &one);
+    try testing.expectEqual(@as(f32, 0), one[0]);
+    try device.setPaused(voice, false);
+    device.mix(1, 44100, &one);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), one[0], 0.001);
+}
+
+test "a voice starts where it is asked to, or held there, and seeks" {
+    var device = try Device.init(testing.allocator, .{ .backend = .mixer });
+    defer device.deinit();
+
+    const clip = try monoClip(&device, &.{ 8192, 16384, 24576, 32767 });
+    const voice = try device.play(clip, .{ .start = 2.0 / 44100.0, .paused = true });
+    defer device.stop(voice);
+    try testing.expect(!device.isPlaying(voice));
+    try testing.expectApproxEqAbs(@as(f64, 2.0 / 44100.0), device.status(voice).position, 1e-9);
+
+    try device.setPaused(voice, false);
+    var one: [1]f32 = undefined;
+    device.mix(1, 44100, &one);
+    try testing.expectApproxEqAbs(@as(f32, 0.75), one[0], 0.001);
+
+    try device.seek(voice, 1.0 / 44100.0);
+    device.mix(1, 44100, &one);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), one[0], 0.001);
+}
+
+test "a voice at twice the speed plays its clip in half the time" {
+    var device = try Device.init(testing.allocator, .{ .backend = .mixer });
+    defer device.deinit();
+
+    const clip = try monoClip(&device, &(.{8192} ** 64));
+    const voice = try device.play(clip, .{ .speed = 2 });
+    defer device.stop(voice);
+
+    var out: [16]f32 = undefined;
+    device.mix(1, 44100, &out);
+    try testing.expectApproxEqAbs(@as(f64, 32.0 / 44100.0), device.status(voice).position, 1e-9);
+    for (out) |sample| try testing.expectApproxEqAbs(@as(f32, 0.25), sample, 0.001);
+
+    try device.setSpeed(voice, 0.5);
+    device.mix(1, 44100, &out);
+    try testing.expectApproxEqAbs(@as(f64, 40.0 / 44100.0), device.status(voice).position, 1e-9);
+}
+
+test "an MP3 is decoded as it plays, without the encoder's silence" {
+    var device = try Device.init(testing.allocator, .{ .backend = .mixer });
+    defer device.deinit();
+
+    // A quarter of a second of 440 Hz at 22050, mono.
+    const clip = try device.loadClip(.{ .format = .mp3, .bytes = @embedFile("../testdata/tone.mp3") });
+    const about = device.clipInfo(clip).?;
+    try testing.expectEqual(@as(u32, 1), about.channels);
+    try testing.expectEqual(@as(u32, 22050), about.sample_rate);
+    try testing.expectApproxEqAbs(@as(f64, 0.25), about.seconds(), 0.01);
+
+    const voice = try device.play(clip, .{});
+    defer device.stop(voice);
+    // The encoder's delay left out, the tone starts at once.
+    var out: [64]f32 = undefined;
+    device.mix(1, 22050, &out);
+    var loudest: f32 = 0;
+    for (out[32..]) |sample| loudest = @max(loudest, @abs(sample));
+    try testing.expect(loudest > 0.05);
+
+    // To the end, and it ends.
+    var rest: [8192]f32 = undefined;
+    device.mix(1, 22050, &rest);
+    try testing.expectEqual(@as(u32, 1), device.status(voice).ends);
+
+    // Seeking to the middle, and looping round.
+    try device.setLooping(voice, true);
+    try device.seek(voice, 0.2);
+    try device.setPaused(voice, false);
+    device.mix(1, 22050, &rest);
+    try testing.expect(device.isPlaying(voice));
+    try testing.expectEqual(@as(u32, 1), device.status(voice).ends);
+
+    try testing.expectError(error.DecodeFailed, device.loadClip(.{ .format = .mp3, .bytes = "not an mp3 at all" }));
 }

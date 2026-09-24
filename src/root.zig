@@ -32,6 +32,8 @@ pub const backend = @import("backend.zig");
 pub const resources = @import("resources.zig");
 
 pub const Device = @import("Device.zig");
+/// RIFF WAVE files, read and written. `Device.loadClip` reads `.wav` itself.
+pub const wav = @import("wav.zig");
 
 pub const Backend = types.Backend;
 /// How to open a backend. See `backend.Opener` and `Device.initWith`.
@@ -41,6 +43,8 @@ pub const Info = types.Info;
 pub const DeviceDesc = types.DeviceDesc;
 pub const ClipFormat = types.ClipFormat;
 pub const ClipDesc = types.ClipDesc;
+pub const ClipInfo = types.ClipInfo;
+pub const VoiceStatus = types.VoiceStatus;
 pub const OscillatorType = types.OscillatorType;
 pub const OscillatorDesc = types.OscillatorDesc;
 pub const PlayDesc = types.PlayDesc;
@@ -57,6 +61,7 @@ test {
     _ = backend;
     _ = resources;
     _ = Device;
+    _ = wav;
     _ = @import("backend/none.zig");
     _ = @import("backend/mixer.zig");
 }

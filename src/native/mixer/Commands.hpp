@@ -37,7 +37,8 @@ namespace fluxion_audio
             setStreamOutput,
             initData,
             initProcessor,
-            updateProcessor
+            updateProcessor,
+            updateStream
         };
 
         explicit constexpr Command(Type initType) noexcept: type{initType} {}
@@ -124,15 +125,25 @@ namespace fluxion_audio
     class InitStreamCommand final: public Command
     {
     public:
-        constexpr InitStreamCommand(ObjectId initStreamId,
-                                    ObjectId initDataId) noexcept:
+        InitStreamCommand(ObjectId initStreamId,
+                          ObjectId initDataId,
+                          fx_audio_voice_state* initState) noexcept:
             Command{Command::Type::initStream},
             streamId{initStreamId},
-            dataId{initDataId}
+            dataId{initDataId},
+            state{initState}
         {}
+
+        // The stream's hold on its state, let go of here when no stream
+        // was made to take it.
+        ~InitStreamCommand() override
+        {
+            releaseVoiceState(state);
+        }
 
         const ObjectId streamId;
         const ObjectId dataId;
+        fx_audio_voice_state* state;
     };
 
     class PlayStreamCommand final: public Command
@@ -214,6 +225,20 @@ namespace fluxion_audio
 
         const ObjectId processorId;
         const std::function<void(Processor*)> updateFunction;
+    };
+
+    class UpdateStreamCommand final: public Command
+    {
+    public:
+        UpdateStreamCommand(ObjectId initStreamId,
+                            const std::function<void(Stream*)>& initUpdateFunction) noexcept:
+            Command{Command::Type::updateStream},
+            streamId{initStreamId},
+            updateFunction{initUpdateFunction}
+        {}
+
+        const ObjectId streamId;
+        const std::function<void(Stream*)> updateFunction;
     };
 
     class CommandBuffer final

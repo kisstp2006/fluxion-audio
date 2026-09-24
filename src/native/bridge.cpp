@@ -11,6 +11,7 @@
 #include "clips/PcmClip.hpp"
 #include "clips/VorbisClip.hpp"
 #include "clips/OscillatorClip.hpp"
+#include "clips/Mp3Clip.hpp"
 #include "effects/VoiceEffects.hpp"
 
 using namespace fluxion_audio;
@@ -22,6 +23,28 @@ namespace
         CommandBuffer buffer;
         buffer.pushCommand(std::move(command));
         m->mixer.submitCommandBuffer(std::move(buffer));
+    }
+
+    // Decoded with `make`, told of in `info`, and handed to the mixer.
+    template <typename Make>
+    int initEncoded(fx_audio_mixer *m, size_t data_id, fx_audio_clip_info *info, Make make)
+    {
+        try
+        {
+            auto data = make();
+            if (info)
+            {
+                info->channels = data->getChannels();
+                info->sample_rate = data->getSampleRate();
+                info->frames = data->getFrames();
+            }
+            submit(m, std::make_unique<InitDataCommand>(data_id, std::move(data)));
+            return 0;
+        }
+        catch (const std::exception &)
+        {
+            return 1;
+        }
     }
 }
 
@@ -89,18 +112,15 @@ void fx_audio_mixer_init_data_pcm_f32(fx_audio_mixer *m, size_t data_id, uint32_
 }
 
 int fx_audio_mixer_init_data_vorbis(fx_audio_mixer *m, size_t data_id, const uint8_t *bytes,
-                                     size_t length)
+                                     size_t length, fx_audio_clip_info *info)
 {
-    try
-    {
-        auto data = makeVorbisData(bytes, length);
-        submit(m, std::make_unique<InitDataCommand>(data_id, std::move(data)));
-        return 0;
-    }
-    catch (const Error &)
-    {
-        return 1;
-    }
+    return initEncoded(m, data_id, info, [&] { return makeVorbisData(bytes, length); });
+}
+
+int fx_audio_mixer_init_data_mp3(fx_audio_mixer *m, size_t data_id, const uint8_t *bytes,
+                                  size_t length, fx_audio_clip_info *info)
+{
+    return initEncoded(m, data_id, info, [&] { return makeMp3Data(bytes, length); });
 }
 
 void fx_audio_mixer_init_data_oscillator(fx_audio_mixer *m, size_t data_id, fx_audio_oscillator_type type,
@@ -120,9 +140,13 @@ void fx_audio_mixer_init_data_oscillator(fx_audio_mixer *m, size_t data_id, fx_a
     submit(m, std::make_unique<InitDataCommand>(data_id, std::move(data)));
 }
 
-void fx_audio_mixer_init_stream(fx_audio_mixer *m, size_t stream_id, size_t data_id)
+fx_audio_voice_state *fx_audio_mixer_init_stream(fx_audio_mixer *m, size_t stream_id, size_t data_id)
 {
-    submit(m, std::make_unique<InitStreamCommand>(stream_id, data_id));
+    // Held twice from the start: by the caller, and by the command until the
+    // stream it makes takes its hold.
+    auto state = new fx_audio_voice_state;
+    submit(m, std::make_unique<InitStreamCommand>(stream_id, data_id, state));
+    return state;
 }
 
 void fx_audio_mixer_play_stream(fx_audio_mixer *m, size_t stream_id)
@@ -140,9 +164,45 @@ void fx_audio_mixer_set_stream_output(fx_audio_mixer *m, size_t stream_id, size_
     submit(m, std::make_unique<SetStreamOutputCommand>(stream_id, bus_id));
 }
 
-int fx_audio_mixer_is_stream_playing(fx_audio_mixer *m, size_t stream_id)
+void fx_audio_mixer_seek_stream(fx_audio_mixer *m, size_t stream_id, uint64_t frame)
 {
-    return m->mixer.isStreamPlaying(stream_id) ? 1 : 0;
+    submit(m, std::make_unique<UpdateStreamCommand>(stream_id, [frame](Stream *s) { s->seek(frame); }));
+}
+
+void fx_audio_mixer_set_stream_looping(fx_audio_mixer *m, size_t stream_id, int looping)
+{
+    submit(m, std::make_unique<UpdateStreamCommand>(stream_id, [looping](Stream *s) { s->setLooping(looping != 0); }));
+}
+
+void fx_audio_mixer_set_stream_speed(fx_audio_mixer *m, size_t stream_id, float speed)
+{
+    submit(m, std::make_unique<UpdateStreamCommand>(stream_id, [speed](Stream *s) { s->setSpeed(speed); }));
+}
+
+int fx_audio_voice_state_playing(const fx_audio_voice_state *state)
+{
+    return state->playing.load(std::memory_order_acquire);
+}
+
+uint64_t fx_audio_voice_state_frame(const fx_audio_voice_state *state)
+{
+    return state->frame.load(std::memory_order_relaxed);
+}
+
+uint32_t fx_audio_voice_state_ends(const fx_audio_voice_state *state)
+{
+    return state->ends.load(std::memory_order_acquire);
+}
+
+void fx_audio_voice_state_expect(fx_audio_voice_state *state, int playing, uint64_t frame)
+{
+    state->frame.store(frame, std::memory_order_relaxed);
+    state->playing.store(playing, std::memory_order_release);
+}
+
+void fx_audio_voice_state_release(fx_audio_voice_state *state)
+{
+    releaseVoiceState(state);
 }
 
 void fx_audio_mixer_init_gain(fx_audio_mixer *m, size_t processor_id, float gain)

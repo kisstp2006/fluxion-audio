@@ -12,6 +12,15 @@ extern "C" {
 
 typedef struct fx_audio_mixer fx_audio_mixer;
 
+/* What a clip is, as its bytes said: `frames` is how long it is, 0 for one
+   with no end. */
+typedef struct fx_audio_clip_info
+{
+    uint32_t channels;
+    uint32_t sample_rate;
+    uint64_t frames;
+} fx_audio_clip_info;
+
 fx_audio_mixer *fx_audio_mixer_create(void);
 void fx_audio_mixer_destroy(fx_audio_mixer *mixer);
 
@@ -43,9 +52,15 @@ void fx_audio_mixer_init_data_pcm_f32(fx_audio_mixer *mixer, size_t data_id,
                                        uint32_t channels, uint32_t sample_rate,
                                        const float *planar,
                                        size_t frame_count);
-/* Returns 0 on success, non-zero if `bytes` did not decode. */
+/* Each returns 0 on success, non-zero if `bytes` did not decode, and says
+   what the clip is in `info`. The bytes are copied, and decoded as the clip
+   plays. */
 int fx_audio_mixer_init_data_vorbis(fx_audio_mixer *mixer, size_t data_id,
-                                     const uint8_t *bytes, size_t length);
+                                     const uint8_t *bytes, size_t length,
+                                     fx_audio_clip_info *info);
+int fx_audio_mixer_init_data_mp3(fx_audio_mixer *mixer, size_t data_id,
+                                  const uint8_t *bytes, size_t length,
+                                  fx_audio_clip_info *info);
 
 typedef enum fx_audio_oscillator_type
 {
@@ -64,17 +79,41 @@ void fx_audio_mixer_init_data_oscillator(fx_audio_mixer *mixer, size_t data_id,
                                           float length_seconds,
                                           uint32_t sample_rate);
 
-void fx_audio_mixer_init_stream(fx_audio_mixer *mixer, size_t stream_id,
-                                 size_t data_id);
+/* What a stream says of itself as it plays, safe to read from any thread
+   while another mixes: see `fx_audio_voice_state_*`. */
+typedef struct fx_audio_voice_state fx_audio_voice_state;
+
+/* Returns the stream's state, for the caller to read and to let go of with
+   `fx_audio_voice_state_release` once done with the stream. */
+fx_audio_voice_state *fx_audio_mixer_init_stream(fx_audio_mixer *mixer,
+                                                  size_t stream_id,
+                                                  size_t data_id);
 void fx_audio_mixer_play_stream(fx_audio_mixer *mixer, size_t stream_id);
 void fx_audio_mixer_stop_stream(fx_audio_mixer *mixer, size_t stream_id,
                                  int reset);
 void fx_audio_mixer_set_stream_output(fx_audio_mixer *mixer, size_t stream_id,
                                        size_t bus_id);
-/* Not safe to call from a thread other than the one calling
-   `fx_audio_mixer_get_samples` - see the note on `Stream::playing` in
-   bridge.cpp. */
-int fx_audio_mixer_is_stream_playing(fx_audio_mixer *mixer, size_t stream_id);
+/* From `frame` of its clip on. */
+void fx_audio_mixer_seek_stream(fx_audio_mixer *mixer, size_t stream_id,
+                                 uint64_t frame);
+/* From the start again at the end, rather than stopping. */
+void fx_audio_mixer_set_stream_looping(fx_audio_mixer *mixer, size_t stream_id,
+                                        int looping);
+/* 1 plays the clip as recorded; 2 twice as fast and an octave up - the clip
+   resampled, which costs next to nothing. */
+void fx_audio_mixer_set_stream_speed(fx_audio_mixer *mixer, size_t stream_id,
+                                      float speed);
+
+int fx_audio_voice_state_playing(const fx_audio_voice_state *state);
+/* Frames into its clip. */
+uint64_t fx_audio_voice_state_frame(const fx_audio_voice_state *state);
+/* How many times it has come to its end and stopped. */
+uint32_t fx_audio_voice_state_ends(const fx_audio_voice_state *state);
+/* What the caller has just asked for, said before the mixing thread gets to
+   it, so a read right after a play or a seek is not the old state. */
+void fx_audio_voice_state_expect(fx_audio_voice_state *state, int playing,
+                                  uint64_t frame);
+void fx_audio_voice_state_release(fx_audio_voice_state *state);
 
 void fx_audio_mixer_init_gain(fx_audio_mixer *mixer, size_t processor_id,
                                float gain);

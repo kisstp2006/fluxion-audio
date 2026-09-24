@@ -29,8 +29,10 @@ pub fn build(b: *std.Build) void {
         .files = &.{
             "src/native/mixer/Bus.cpp",
             "src/native/mixer/Mixer.cpp",
+            "src/native/mixer/Stream.cpp",
             "src/native/clips/PcmClip.cpp",
             "src/native/clips/VorbisClip.cpp",
+            "src/native/clips/Mp3Clip.cpp",
             "src/native/clips/OscillatorClip.cpp",
             "src/native/bridge.cpp",
         },

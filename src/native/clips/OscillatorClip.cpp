@@ -27,83 +27,73 @@ namespace fluxion_audio
             return 0.0F;
         }
 
-        class OscillatorData;
-
-        class OscillatorStream final: public Stream
-        {
-        public:
-            explicit OscillatorStream(OscillatorData& oscillatorData) noexcept;
-
-            void reset() override
-            {
-                position = 0;
-            }
-
-            void generateSamples(std::uint32_t frames, std::vector<float>& samples) override;
-
-        private:
-            std::uint64_t position = 0;
-        };
-
         class OscillatorData final: public Data
         {
         public:
             OscillatorData(OscillatorType initType, float initFrequency, float initAmplitude,
                           float initLength, std::uint32_t initSampleRate) noexcept:
                 Data{1, initSampleRate},
-                type{initType}, frequency{initFrequency}, amplitude{initAmplitude}, length{initLength}
+                type{initType}, frequency{initFrequency}, amplitude{initAmplitude},
+                frames{initLength > 0.0F ? static_cast<std::uint64_t>(std::llround(static_cast<double>(initLength) * initSampleRate)) : 0}
             {
             }
 
             auto getType() const noexcept { return type; }
             auto getFrequency() const noexcept { return frequency; }
             auto getAmplitude() const noexcept { return amplitude; }
-            auto getLength() const noexcept { return length; }
 
-            std::unique_ptr<Stream> createStream() override
-            {
-                return std::make_unique<OscillatorStream>(*this);
-            }
+            std::uint64_t getFrames() const noexcept override { return frames; }
+
+            std::unique_ptr<Stream> createStream(fx_audio_voice_state* state) override;
 
         private:
             OscillatorType type;
             float frequency;
             float amplitude;
-            float length;
+            // 0 for one that plays for ever.
+            std::uint64_t frames;
         };
 
-        OscillatorStream::OscillatorStream(OscillatorData& oscillatorData) noexcept:
-            Stream{oscillatorData}
+        class OscillatorStream final: public Stream
         {
-        }
-
-        void OscillatorStream::generateSamples(std::uint32_t frames, std::vector<float>& samples)
-        {
-            const auto& oscillatorData = static_cast<const OscillatorData&>(data);
-            samples.resize(frames);
-
-            const auto sampleRate = data.getSampleRate();
-            const auto length = oscillatorData.getLength();
-            const std::uint64_t totalFrames = length > 0.0F
-                ? static_cast<std::uint64_t>(length * static_cast<float>(sampleRate))
-                : 0; // 0 means endless
-
-            std::uint32_t written = 0;
-            while (written < frames && (totalFrames == 0 || position < totalFrames))
+        public:
+            OscillatorStream(OscillatorData& oscillatorData, fx_audio_voice_state* state) noexcept:
+                Stream{oscillatorData, state}
             {
-                const auto cycles = static_cast<float>(position) * oscillatorData.getFrequency() / static_cast<float>(sampleRate);
-                const auto phase = cycles - std::floor(cycles);
-                samples[written] = waveAt(oscillatorData.getType(), phase) * oscillatorData.getAmplitude();
-                ++position;
-                ++written;
             }
 
-            if (written < frames)
+        protected:
+            std::uint32_t read(float* samples, std::uint32_t stride, std::uint32_t offset, std::uint32_t count) override
             {
-                std::fill(samples.begin() + written, samples.end(), 0.0F);
-                playing = false;
-                reset();
+                (void)stride;
+                const auto& oscillatorData = static_cast<const OscillatorData&>(data);
+                const auto sampleRate = static_cast<float>(data.getSampleRate());
+                const auto totalFrames = oscillatorData.getFrames();
+
+                std::uint32_t written = 0;
+                while (written < count && (totalFrames == 0 || cursor < totalFrames))
+                {
+                    const auto cycles = static_cast<float>(cursor) * oscillatorData.getFrequency() / sampleRate;
+                    const auto phase = cycles - std::floor(cycles);
+                    samples[offset + written] = waveAt(oscillatorData.getType(), phase) * oscillatorData.getAmplitude();
+                    ++cursor;
+                    ++written;
+                }
+                return written;
             }
+
+            void rewind(std::uint64_t frame) override
+            {
+                cursor = frame;
+            }
+
+        private:
+            std::uint64_t cursor = 0;
+        };
+
+        std::unique_ptr<Stream> OscillatorData::createStream(fx_audio_voice_state* state)
+        {
+            return std::make_unique<OscillatorStream>(*this, state);
         }
     }
 

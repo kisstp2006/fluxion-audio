@@ -26,6 +26,7 @@ const Allocator = std.mem.Allocator;
 const types = @import("types.zig");
 const resources = @import("resources.zig");
 const backend = @import("backend.zig");
+const wav = @import("wav.zig");
 
 const is_android = builtin.target.abi == .android;
 const is_linux_desktop = builtin.os.tag == .linux and !is_android;
@@ -129,18 +130,42 @@ pub fn info(self: *const Device) types.Info {
 }
 
 pub fn loadClip(self: *Device, desc: types.ClipDesc) Error!types.Clip {
-    const native = try self.vtable.loadClip(self.impl, desc);
-    errdefer self.vtable.unloadClip(self.impl, native);
-    return self.clips.add(self.gpa, .{ .native = native });
+    if (desc.format == .wav) {
+        const wave = wav.read(self.gpa, desc.bytes) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.NotWav, error.Unsupported => error.DecodeFailed,
+        };
+        defer wave.deinit(self.gpa);
+        return self.loadClip(.{ .format = .pcm_f32, .samples = wave.samples, .channels = wave.channels, .sample_rate = wave.sample_rate });
+    }
+    const loaded = try self.vtable.loadClip(self.impl, desc);
+    errdefer self.vtable.unloadClip(self.impl, loaded.native);
+    return self.clips.add(self.gpa, .{ .native = loaded.native, .info = loaded.info });
 }
 
 pub fn loadOscillator(self: *Device, desc: types.OscillatorDesc) Error!types.Clip {
-    const native = try self.vtable.loadOscillator(self.impl, desc);
-    errdefer self.vtable.unloadClip(self.impl, native);
-    return self.clips.add(self.gpa, .{ .native = native });
+    const loaded = try self.vtable.loadOscillator(self.impl, desc);
+    errdefer self.vtable.unloadClip(self.impl, loaded.native);
+    return self.clips.add(self.gpa, .{ .native = loaded.native, .info = loaded.info });
 }
 
+/// What a clip is - its channels, its rate and its length - or null for a
+/// handle that is not one.
+pub fn clipInfo(self: *Device, clip: types.Clip) ?types.ClipInfo {
+    const entry = self.clips.get(clip) orelse return null;
+    return entry.info;
+}
+
+/// Let a clip go, and stop every voice playing it first: a voice reads its
+/// clip as it plays.
 pub fn unloadClip(self: *Device, clip: types.Clip) void {
+    if (self.clips.get(clip) == null) return;
+    var voices = self.voices.iterator();
+    while (voices.next()) |entry| {
+        if (!std.meta.eql(entry.value.clip, clip)) continue;
+        self.vtable.stopVoice(self.impl, entry.value.native);
+        _ = self.voices.remove(entry.handle);
+    }
     if (self.clips.remove(clip)) |entry| self.vtable.unloadClip(self.impl, entry.native);
 }
 
@@ -150,13 +175,50 @@ pub fn play(self: *Device, clip: types.Clip, desc: types.PlayDesc) Error!types.V
         (self.submixes.get(submix) orelse return error.InvalidHandle).native
     else
         null;
-    const native = try self.vtable.play(self.impl, clip_entry.native, output_native, desc);
+    const rate = clip_entry.info.sample_rate;
+    const native = try self.vtable.play(self.impl, clip_entry.native, output_native, desc, framesOf(desc.start, rate));
     errdefer self.vtable.stopVoice(self.impl, native);
-    return self.voices.add(self.gpa, .{ .native = native });
+    return self.voices.add(self.gpa, .{ .native = native, .clip = clip, .sample_rate = rate });
 }
 
 pub fn stop(self: *Device, voice: types.Voice) void {
     if (self.voices.remove(voice)) |entry| self.vtable.stopVoice(self.impl, entry.native);
+}
+
+/// Held where it is, or going on from there.
+pub fn setPaused(self: *Device, voice: types.Voice, paused: bool) Error!void {
+    const entry = self.voices.get(voice) orelse return error.InvalidHandle;
+    self.vtable.setVoicePaused(self.impl, entry.native, paused);
+}
+
+/// `seconds` into its clip, playing or held as it was.
+pub fn seek(self: *Device, voice: types.Voice, seconds: f64) Error!void {
+    const entry = self.voices.get(voice) orelse return error.InvalidHandle;
+    self.vtable.seekVoice(self.impl, entry.native, framesOf(seconds, entry.sample_rate));
+}
+
+pub fn setLooping(self: *Device, voice: types.Voice, looping: bool) Error!void {
+    const entry = self.voices.get(voice) orelse return error.InvalidHandle;
+    self.vtable.setVoiceLooping(self.impl, entry.native, looping);
+}
+
+/// See `PlayDesc.speed`.
+pub fn setSpeed(self: *Device, voice: types.Voice, speed: f32) Error!void {
+    const entry = self.voices.get(voice) orelse return error.InvalidHandle;
+    self.vtable.setVoiceSpeed(self.impl, entry.native, @max(speed, 0.01));
+}
+
+/// How the voice is doing; a handle that is not one's is not playing.
+pub fn status(self: *Device, voice: types.Voice) types.VoiceStatus {
+    const entry = self.voices.get(voice) orelse return .{};
+    const raw = self.vtable.voiceStatus(self.impl, entry.native);
+    const seconds: f64 = if (entry.sample_rate == 0) 0 else @as(f64, @floatFromInt(raw.frame)) / @as(f64, @floatFromInt(entry.sample_rate));
+    return .{ .playing = raw.playing, .position = seconds, .ends = raw.ends };
+}
+
+fn framesOf(seconds: f64, rate: u32) u64 {
+    if (!(seconds > 0)) return 0;
+    return @intFromFloat(seconds * @as(f64, @floatFromInt(rate)));
 }
 
 /// A bus of its own that voices (or other submixes) can be routed into
@@ -206,8 +268,7 @@ pub fn setPitch(self: *Device, voice: types.Voice, pitch: f32) Error!void {
 }
 
 pub fn isPlaying(self: *Device, voice: types.Voice) bool {
-    const entry = self.voices.get(voice) orelse return false;
-    return self.vtable.isVoicePlaying(self.impl, entry.native);
+    return self.status(voice).playing;
 }
 
 /// Mixes `out.len / channels` frames into `out`, planar by channel: `out[0
@@ -263,7 +324,7 @@ test "initWith opens a backend the caller supplies, under its own name" {
     try testing.expectEqual(types.Backend.other, device.info().backend);
 
     // it is a working device, not a label
-    const clip = try device.loadClip(.{ .format = .pcm_s16, .bytes = &.{} });
+    const clip = try device.loadClip(.{ .format = .pcm_s16 });
     const voice = try device.play(clip, .{});
     device.stop(voice);
     device.unloadClip(clip);
@@ -284,7 +345,7 @@ test "a clip and a voice are real, distinct handles" {
     var device = try Device.init(testing.allocator, .{});
     defer device.deinit();
 
-    const clip = try device.loadClip(.{ .format = .pcm_s16, .bytes = &.{} });
+    const clip = try device.loadClip(.{ .format = .pcm_s16 });
     const voice = try device.play(clip, .{});
     try testing.expect(!device.isPlaying(voice));
 
@@ -296,7 +357,7 @@ test "a stopped voice is refused, not followed" {
     var device = try Device.init(testing.allocator, .{});
     defer device.deinit();
 
-    const clip = try device.loadClip(.{ .format = .pcm_s16, .bytes = &.{} });
+    const clip = try device.loadClip(.{ .format = .pcm_s16 });
     const voice = try device.play(clip, .{});
     device.stop(voice);
 
@@ -306,7 +367,7 @@ test "a stopped voice is refused, not followed" {
 
 test "deinit cleans up whatever was left playing or loaded" {
     var device = try Device.init(testing.allocator, .{});
-    const clip = try device.loadClip(.{ .format = .vorbis, .bytes = &.{} });
+    const clip = try device.loadClip(.{ .format = .vorbis });
     _ = try device.play(clip, .{});
     // Neither the clip nor the voice was released by hand - deinit has to
     // walk both tables itself, or this leaks under the testing allocator.
@@ -320,7 +381,7 @@ test "a submix is a real, distinct handle a voice can play through" {
     const music = try device.createSubmix(.{ .volume = 0.7 });
     defer device.destroySubmix(music);
 
-    const clip = try device.loadClip(.{ .format = .pcm_s16, .bytes = &.{} });
+    const clip = try device.loadClip(.{ .format = .pcm_s16 });
     const voice = try device.play(clip, .{ .output = music });
     defer device.stop(voice);
 
@@ -347,4 +408,32 @@ test "deinit cleans up submixes too" {
     var device = try Device.init(testing.allocator, .{});
     _ = try device.createSubmix(.{});
     device.deinit();
+}
+
+test "a WAVE file is read on any backend, and says what it is" {
+    var device = try Device.init(testing.allocator, .{});
+    defer device.deinit();
+
+    const file = try wav.write(testing.allocator, i16, 2, 22050, &(.{0} ** 44100));
+    defer testing.allocator.free(file);
+    const clip = try device.loadClip(.{ .format = .wav, .bytes = file });
+    const about = device.clipInfo(clip).?;
+    try testing.expectEqual(@as(u32, 2), about.channels);
+    try testing.expectEqual(@as(u64, 22050), about.frames);
+    try testing.expectApproxEqAbs(@as(f64, 1), about.seconds(), 0.0001);
+    try testing.expectError(error.DecodeFailed, device.loadClip(.{ .format = .wav, .bytes = "not a wave" }));
+}
+
+test "a clip let go of stops what plays it first" {
+    var device = try Device.init(testing.allocator, .{ .backend = .mixer });
+    defer device.deinit();
+
+    const tone = [_]i16{16384} ** 8;
+    const clip = try device.loadClip(.{ .format = .pcm_s16, .bytes = std.mem.sliceAsBytes(&tone), .channels = 1 });
+    const voice = try device.play(clip, .{});
+    device.unloadClip(clip);
+    try testing.expectError(error.InvalidHandle, device.setVolume(voice, 0.5));
+    var out: [4]f32 = undefined;
+    device.mix(1, 44100, &out);
+    try testing.expectEqual(@as(f32, 0), out[0]);
 }

@@ -61,28 +61,85 @@ pub const Info = struct {
     name: []const u8 = "",
 };
 
-/// How to read the bytes handed to `Device.loadClip`.
-pub const ClipFormat = enum { pcm_s16, vorbis };
+/// How to read what is handed to `Device.loadClip`.
+pub const ClipFormat = enum {
+    /// `bytes`: interleaved signed 16-bit samples, of `channels` and at
+    /// `sample_rate`.
+    pcm_s16,
+    /// `samples`: 32-bit floats, planar - one channel's in full, then the
+    /// next - of `channels` and at `sample_rate`. What a program that makes
+    /// its own sound hands over.
+    pcm_f32,
+    /// `bytes`: a RIFF WAVE file - 8, 16, 24 or 32-bit integers, or 32 or
+    /// 64-bit floats - read in whole.
+    wav,
+    /// `bytes`: an Ogg Vorbis file, decoded as it plays.
+    vorbis,
+    /// `bytes`: an MP3 file, decoded as it plays. The silence an encoder puts
+    /// before and after the music, when its LAME tag says how much, is left
+    /// out, so a clip that loops goes round without a gap.
+    mp3,
+};
 
 pub const ClipDesc = struct {
     format: ClipFormat,
-    /// For `.pcm_s16`: interleaved samples. For `.vorbis`: an Ogg Vorbis
-    /// file, exactly as read from disk - channels and sample rate come from
-    /// its own header, and `channels`/`sample_rate` below are ignored.
-    bytes: []const u8,
+    /// For every format but `.pcm_f32`: as read from disk. A file says its
+    /// own channels and rate, and `channels`/`sample_rate` below are only
+    /// for the raw formats.
+    bytes: []const u8 = &.{},
+    /// For `.pcm_f32`.
+    samples: []const f32 = &.{},
     channels: u32 = 2,
     sample_rate: u32 = 44100,
+};
+
+/// What a clip is, once loaded.
+pub const ClipInfo = struct {
+    channels: u32 = 0,
+    sample_rate: u32 = 0,
+    /// How long it is, in frames: 0 for a clip with no end, and for one the
+    /// backend does not decode.
+    frames: u64 = 0,
+
+    pub fn seconds(self: ClipInfo) f64 {
+        if (self.sample_rate == 0) return 0;
+        return @as(f64, @floatFromInt(self.frames)) / @as(f64, @floatFromInt(self.sample_rate));
+    }
 };
 
 pub const PlayDesc = struct {
     volume: f32 = 1,
     pan: f32 = 0,
-    /// 1 is unchanged, 0.5 is an octave down, 2 is an octave up. Left at 1,
-    /// the pitch-shift processor is a no-op that costs nothing.
+    /// 1 is unchanged, 0.5 is an octave down, 2 is an octave up, and the clip
+    /// keeps its time. Left at 1, the pitch-shift processor is a no-op that
+    /// costs nothing; away from it, a phase vocoder runs, which is not cheap.
     pitch: f32 = 1,
+    /// 1 plays the clip as it was recorded; 2 twice as fast and an octave
+    /// up; 0.5 half as fast and an octave down. The clip is resampled, which
+    /// costs next to nothing: what a game wants for a sound that is a little
+    /// different each time.
+    speed: f32 = 1,
+    /// From the start again at the end, rather than stopping.
+    loop: bool = false,
+    /// Seconds into the clip to start from.
+    start: f64 = 0,
+    /// Made, and held until `Device.setPaused(voice, false)`.
+    paused: bool = false,
     /// Which submix this voice feeds into. `null` goes straight to the
     /// master bus, same as before submixes existed.
     output: ?Submix = null,
+};
+
+/// How a voice is doing, read on the thread that asks without waiting on
+/// the one that mixes.
+pub const VoiceStatus = struct {
+    playing: bool = false,
+    /// Seconds into its clip.
+    position: f64 = 0,
+    /// How many times it has come to its end and stopped: what a program
+    /// compares with the count it last saw to hear that a voice has
+    /// finished. A voice that loops never does.
+    ends: u32 = 0,
 };
 
 /// A named group of voices - a "music" bus, a "sfx" bus - with its own
@@ -104,3 +161,10 @@ pub const OscillatorDesc = struct {
     length: f32 = 0,
     sample_rate: u32 = 44100,
 };
+
+/// How many frames an oscillator's `length` is, to the nearest: 0 for one
+/// that plays for ever. The native side counts them the same way.
+pub fn oscillatorFrames(desc: OscillatorDesc) u64 {
+    if (!(desc.length > 0)) return 0;
+    return @intFromFloat(@round(@as(f64, desc.length) * @as(f64, @floatFromInt(desc.sample_rate))));
+}

@@ -53,15 +53,6 @@ namespace fluxion_audio
             deletedObjectIds.insert(objectId);
         }
 
-        // Reads the object table directly, bypassing the command queue.
-        // Only `getSamples` is meant to touch `objects` from outside a
-        // command - this is a second, deliberate exception for a read-only
-        // status check, and it is safe only as long as `getSamples` is
-        // pumped from the same thread that calls this. A backend with its
-        // own independent output thread needs a real cross-thread flag
-        // instead, not this.
-        bool isStreamPlaying(ObjectId streamId) const;
-
         // Thread-safe: called from whatever thread `Device` is used on.
         void submitCommandBuffer(CommandBuffer&& commandBuffer)
         {
