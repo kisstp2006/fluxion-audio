@@ -45,13 +45,15 @@ pub fn build(b: *std.Build) void {
     const is_windows = target.result.os.tag == .windows;
     if (is_windows) mod.linkSystemLibrary("ole32", .{});
 
-    // The `alsa` and `opensl` backends: one per target, never both, and
-    // neither one built for a target that has no way to link it.
+    // The `alsa` and `opensl` backends: one per target, never both. ALSA is
+    // opened as the program runs, not linked - see `backends/alsa.cpp` - so a
+    // Linux build needs nothing of it, and runs silent on a machine without
+    // it; `dl` is glibc's home for `dlopen` before 2.34.
     const is_android = target.result.abi == .android;
     const is_linux_desktop = target.result.os.tag == .linux and !is_android;
     if (is_linux_desktop) {
         mod.addCSourceFiles(.{ .files = &.{"src/native/backends/alsa.cpp"}, .flags = &.{"-std=c++17"} });
-        mod.linkSystemLibrary("asound", .{});
+        mod.linkSystemLibrary("dl", .{});
     }
     if (is_android) {
         mod.addCSourceFiles(.{ .files = &.{"src/native/backends/opensl.cpp"}, .flags = &.{"-std=c++17"} });

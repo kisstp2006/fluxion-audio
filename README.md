@@ -42,6 +42,11 @@ The three output backends are the `mixer` backend with an `Output` attached
 to it - the thread of their own that pulls from the graph and feeds the sound
 card - so every call but opening and closing is the mixer's.
 
+**ALSA is opened, not linked.** The `alsa` backend loads `libasound.so.2`
+when its first output opens, so a Linux build needs neither its headers nor
+the library - it cross-compiles from any machine - and a machine without it
+opens no output, the way one without a sound card does.
+
 **Choosing a backend without the enum.** `Device.init` picks from the backends
 above. A program that wants to decide some other way - by name, from a
 configuration file, from what a registry holds - uses openers:

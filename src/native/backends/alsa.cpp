@@ -3,16 +3,117 @@
 #include "alsa.hpp"
 #include "../mixer_handle.hpp"
 
-#include <alsa/asoundlib.h>
 #include <atomic>
 #include <cerrno>
+#include <dlfcn.h>
+#include <memory>
 #include <thread>
 #include <vector>
+
+// ALSA is opened when the first output is, not linked: a program built for
+// Linux runs on a machine without it - silent - and builds on one without its
+// headers. What is declared here is the part of `alsa/asoundlib.h` this file
+// uses, with the numbers the headers give.
+namespace
+{
+    struct snd_pcm_t;
+    struct snd_pcm_hw_params_t;
+    struct snd_pcm_sw_params_t;
+    using snd_pcm_uframes_t = unsigned long;
+    using snd_pcm_sframes_t = long;
+
+    constexpr int stream_playback = 0;       // SND_PCM_STREAM_PLAYBACK
+    constexpr int open_nonblock = 0x1;       // SND_PCM_NONBLOCK
+    constexpr int access_rw_interleaved = 3; // SND_PCM_ACCESS_RW_INTERLEAVED
+    constexpr int format_s16_le = 2;         // SND_PCM_FORMAT_S16_LE
+    constexpr int format_float_le = 14;      // SND_PCM_FORMAT_FLOAT_LE
+
+    struct Alsa
+    {
+        int (*pcm_open)(snd_pcm_t **, const char *, int, int);
+        int (*pcm_close)(snd_pcm_t *);
+        int (*pcm_prepare)(snd_pcm_t *);
+        int (*pcm_reset)(snd_pcm_t *);
+        snd_pcm_sframes_t (*pcm_avail_update)(snd_pcm_t *);
+        snd_pcm_sframes_t (*pcm_writei)(snd_pcm_t *, const void *, snd_pcm_uframes_t);
+        int (*hw_params_malloc)(snd_pcm_hw_params_t **);
+        void (*hw_params_free)(snd_pcm_hw_params_t *);
+        int (*hw_params_any)(snd_pcm_t *, snd_pcm_hw_params_t *);
+        int (*hw_params_set_access)(snd_pcm_t *, snd_pcm_hw_params_t *, int);
+        int (*hw_params_test_format)(snd_pcm_t *, snd_pcm_hw_params_t *, int);
+        int (*hw_params_set_format)(snd_pcm_t *, snd_pcm_hw_params_t *, int);
+        int (*hw_params_set_rate)(snd_pcm_t *, snd_pcm_hw_params_t *, unsigned int, int);
+        int (*hw_params_set_channels)(snd_pcm_t *, snd_pcm_hw_params_t *, unsigned int);
+        int (*hw_params_set_buffer_time_near)(snd_pcm_t *, snd_pcm_hw_params_t *, unsigned int *, int *);
+        int (*hw_params_set_period_time_near)(snd_pcm_t *, snd_pcm_hw_params_t *, unsigned int *, int *);
+        int (*hw_params_get_period_size)(const snd_pcm_hw_params_t *, snd_pcm_uframes_t *, int *);
+        int (*hw_params_get_periods)(const snd_pcm_hw_params_t *, unsigned int *, int *);
+        int (*hw_params)(snd_pcm_t *, snd_pcm_hw_params_t *);
+        int (*sw_params_malloc)(snd_pcm_sw_params_t **);
+        void (*sw_params_free)(snd_pcm_sw_params_t *);
+        int (*sw_params_current)(snd_pcm_t *, snd_pcm_sw_params_t *);
+        int (*sw_params_set_avail_min)(snd_pcm_t *, snd_pcm_sw_params_t *, snd_pcm_uframes_t);
+        int (*sw_params_set_start_threshold)(snd_pcm_t *, snd_pcm_sw_params_t *, snd_pcm_uframes_t);
+        int (*sw_params)(snd_pcm_t *, snd_pcm_sw_params_t *);
+    };
+
+    template <typename F>
+    bool find(void *library, const char *name, F &into)
+    {
+        into = reinterpret_cast<F>(dlsym(library, name));
+        return into != nullptr;
+    }
+
+    // The library, opened once and kept: an output closed and opened again
+    // finds it where it was. Null when this machine has no ALSA.
+    const Alsa *library()
+    {
+        static const Alsa *const loaded = []() -> const Alsa * {
+            void *library = dlopen("libasound.so.2", RTLD_NOW | RTLD_LOCAL);
+            if (!library) return nullptr;
+            static Alsa a;
+            const bool all =
+                find(library, "snd_pcm_open", a.pcm_open) &&
+                find(library, "snd_pcm_close", a.pcm_close) &&
+                find(library, "snd_pcm_prepare", a.pcm_prepare) &&
+                find(library, "snd_pcm_reset", a.pcm_reset) &&
+                find(library, "snd_pcm_avail_update", a.pcm_avail_update) &&
+                find(library, "snd_pcm_writei", a.pcm_writei) &&
+                find(library, "snd_pcm_hw_params_malloc", a.hw_params_malloc) &&
+                find(library, "snd_pcm_hw_params_free", a.hw_params_free) &&
+                find(library, "snd_pcm_hw_params_any", a.hw_params_any) &&
+                find(library, "snd_pcm_hw_params_set_access", a.hw_params_set_access) &&
+                find(library, "snd_pcm_hw_params_test_format", a.hw_params_test_format) &&
+                find(library, "snd_pcm_hw_params_set_format", a.hw_params_set_format) &&
+                find(library, "snd_pcm_hw_params_set_rate", a.hw_params_set_rate) &&
+                find(library, "snd_pcm_hw_params_set_channels", a.hw_params_set_channels) &&
+                find(library, "snd_pcm_hw_params_set_buffer_time_near", a.hw_params_set_buffer_time_near) &&
+                find(library, "snd_pcm_hw_params_set_period_time_near", a.hw_params_set_period_time_near) &&
+                find(library, "snd_pcm_hw_params_get_period_size", a.hw_params_get_period_size) &&
+                find(library, "snd_pcm_hw_params_get_periods", a.hw_params_get_periods) &&
+                find(library, "snd_pcm_hw_params", a.hw_params) &&
+                find(library, "snd_pcm_sw_params_malloc", a.sw_params_malloc) &&
+                find(library, "snd_pcm_sw_params_free", a.sw_params_free) &&
+                find(library, "snd_pcm_sw_params_current", a.sw_params_current) &&
+                find(library, "snd_pcm_sw_params_set_avail_min", a.sw_params_set_avail_min) &&
+                find(library, "snd_pcm_sw_params_set_start_threshold", a.sw_params_set_start_threshold) &&
+                find(library, "snd_pcm_sw_params", a.sw_params);
+            if (!all)
+            {
+                dlclose(library);
+                return nullptr;
+            }
+            return &a;
+        }();
+        return loaded;
+    }
+}
 
 namespace fluxion_audio::alsa
 {
     struct Output
     {
+        const Alsa *api;
         fx_audio_mixer *mixer;
         snd_pcm_t *playback_handle = nullptr;
         unsigned int channels = 2;
@@ -27,23 +128,48 @@ namespace fluxion_audio::alsa
         std::atomic_bool running{false};
         std::thread audio_thread;
 
+        ~Output()
+        {
+            if (playback_handle) api->pcm_close(playback_handle);
+        }
+
         void run();
     };
 
     namespace
     {
+        struct HwParams
+        {
+            const Alsa *api;
+            snd_pcm_hw_params_t *params = nullptr;
+            ~HwParams()
+            {
+                if (params) api->hw_params_free(params);
+            }
+        };
+
+        struct SwParams
+        {
+            const Alsa *api;
+            snd_pcm_sw_params_t *params = nullptr;
+            ~SwParams()
+            {
+                if (params) api->sw_params_free(params);
+            }
+        };
+
         // True if the negotiated buffer is IEEE float; false for signed
         // 16-bit - the two formats ALSA is asked to try, in that order.
-        bool negotiateFormat(snd_pcm_t *handle, snd_pcm_hw_params_t *hw_params)
+        bool negotiateFormat(const Alsa *api, snd_pcm_t *handle, snd_pcm_hw_params_t *hw_params)
         {
-            if (snd_pcm_hw_params_test_format(handle, hw_params, SND_PCM_FORMAT_FLOAT_LE) == 0)
+            if (api->hw_params_test_format(handle, hw_params, format_float_le) == 0)
             {
-                snd_pcm_hw_params_set_format(handle, hw_params, SND_PCM_FORMAT_FLOAT_LE);
+                api->hw_params_set_format(handle, hw_params, format_float_le);
                 return true;
             }
-            if (snd_pcm_hw_params_test_format(handle, hw_params, SND_PCM_FORMAT_S16_LE) == 0)
+            if (api->hw_params_test_format(handle, hw_params, format_s16_le) == 0)
             {
-                snd_pcm_hw_params_set_format(handle, hw_params, SND_PCM_FORMAT_S16_LE);
+                api->hw_params_set_format(handle, hw_params, format_s16_le);
                 return false;
             }
             return false;
@@ -52,50 +178,56 @@ namespace fluxion_audio::alsa
 
     Output *open(fx_audio_mixer *mixer, std::uint32_t *channels, std::uint32_t *sample_rate)
     {
+        const Alsa *api = library();
+        if (!api) return nullptr;
+
         auto output = std::make_unique<Output>();
+        output->api = api;
         output->mixer = mixer;
         output->channels = *channels != 0 ? *channels : 2;
         output->sample_rate = *sample_rate != 0 ? *sample_rate : 44100;
 
-        if (snd_pcm_open(&output->playback_handle, "default", SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK) < 0)
+        if (api->pcm_open(&output->playback_handle, "default", stream_playback, open_nonblock) < 0)
+        {
+            output->playback_handle = nullptr;
+            return nullptr;
+        }
+
+        HwParams hw{api};
+        if (api->hw_params_malloc(&hw.params) != 0) return nullptr;
+        if (api->hw_params_any(output->playback_handle, hw.params) < 0)
+            return nullptr;
+        if (api->hw_params_set_access(output->playback_handle, hw.params, access_rw_interleaved) != 0)
             return nullptr;
 
-        snd_pcm_hw_params_t *hw_params = nullptr;
-        snd_pcm_hw_params_alloca(&hw_params);
+        output->is_float = negotiateFormat(api, output->playback_handle, hw.params);
 
-        if (snd_pcm_hw_params_any(output->playback_handle, hw_params) < 0)
+        if (api->hw_params_set_rate(output->playback_handle, hw.params, output->sample_rate, 0) != 0)
             return nullptr;
-        if (snd_pcm_hw_params_set_access(output->playback_handle, hw_params, SND_PCM_ACCESS_RW_INTERLEAVED) != 0)
-            return nullptr;
-
-        output->is_float = negotiateFormat(output->playback_handle, hw_params);
-
-        if (snd_pcm_hw_params_set_rate(output->playback_handle, hw_params, output->sample_rate, 0) != 0)
-            return nullptr;
-        if (snd_pcm_hw_params_set_channels(output->playback_handle, hw_params, output->channels) != 0)
+        if (api->hw_params_set_channels(output->playback_handle, hw.params, output->channels) != 0)
             return nullptr;
 
         unsigned int period_length = static_cast<unsigned int>(output->period_size) * 1000000U / output->sample_rate;
         unsigned int buffer_length = period_length * output->periods;
         int dir;
-        snd_pcm_hw_params_set_buffer_time_near(output->playback_handle, hw_params, &buffer_length, &dir);
-        snd_pcm_hw_params_set_period_time_near(output->playback_handle, hw_params, &period_length, &dir);
-        snd_pcm_hw_params_get_period_size(hw_params, &output->period_size, &dir);
-        snd_pcm_hw_params_get_periods(hw_params, &output->periods, &dir);
+        api->hw_params_set_buffer_time_near(output->playback_handle, hw.params, &buffer_length, &dir);
+        api->hw_params_set_period_time_near(output->playback_handle, hw.params, &period_length, &dir);
+        api->hw_params_get_period_size(hw.params, &output->period_size, &dir);
+        api->hw_params_get_periods(hw.params, &output->periods, &dir);
 
-        if (snd_pcm_hw_params(output->playback_handle, hw_params) != 0)
+        if (api->hw_params(output->playback_handle, hw.params) != 0)
             return nullptr;
 
-        snd_pcm_sw_params_t *sw_params = nullptr;
-        snd_pcm_sw_params_alloca(&sw_params);
-        if (snd_pcm_sw_params_current(output->playback_handle, sw_params) != 0)
+        SwParams sw{api};
+        if (api->sw_params_malloc(&sw.params) != 0) return nullptr;
+        if (api->sw_params_current(output->playback_handle, sw.params) != 0)
             return nullptr;
-        snd_pcm_sw_params_set_avail_min(output->playback_handle, sw_params, 4096);
-        snd_pcm_sw_params_set_start_threshold(output->playback_handle, sw_params, 0);
-        if (snd_pcm_sw_params(output->playback_handle, sw_params) != 0)
+        api->sw_params_set_avail_min(output->playback_handle, sw.params, 4096);
+        api->sw_params_set_start_threshold(output->playback_handle, sw.params, 0);
+        if (api->sw_params(output->playback_handle, sw.params) != 0)
             return nullptr;
 
-        if (snd_pcm_prepare(output->playback_handle) != 0)
+        if (api->pcm_prepare(output->playback_handle) != 0)
             return nullptr;
 
         *channels = output->channels;
@@ -111,7 +243,6 @@ namespace fluxion_audio::alsa
         if (!output) return;
         output->running = false;
         if (output->audio_thread.joinable()) output->audio_thread.join();
-        if (output->playback_handle) snd_pcm_close(output->playback_handle);
         delete output;
     }
 
@@ -119,19 +250,19 @@ namespace fluxion_audio::alsa
     {
         while (running)
         {
-            snd_pcm_sframes_t frames = snd_pcm_avail_update(playback_handle);
+            snd_pcm_sframes_t frames = api->pcm_avail_update(playback_handle);
             if (frames < 0)
             {
                 if (frames == -EPIPE)
                 {
-                    snd_pcm_prepare(playback_handle);
+                    api->pcm_prepare(playback_handle);
                     continue;
                 }
                 break;
             }
             if (static_cast<snd_pcm_uframes_t>(frames) > periods * period_size)
             {
-                snd_pcm_reset(playback_handle);
+                api->pcm_reset(playback_handle);
                 continue;
             }
             if (static_cast<snd_pcm_uframes_t>(frames) < period_size)
@@ -162,9 +293,9 @@ namespace fluxion_audio::alsa
                     }
             }
 
-            const auto result = snd_pcm_writei(playback_handle, interleaved.data(), frames);
+            const auto result = api->pcm_writei(playback_handle, interleaved.data(), frames);
             if (result == -EPIPE)
-                snd_pcm_prepare(playback_handle);
+                api->pcm_prepare(playback_handle);
         }
     }
 }
