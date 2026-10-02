@@ -14,8 +14,7 @@ const Allocator = std.mem.Allocator;
 const types = @import("../types.zig");
 const backend = @import("../backend.zig");
 const mixer_backend = @import("mixer.zig");
-const native = @import("../native.zig");
-const c = native.c;
+const c = @cImport(@cInclude("output.h"));
 
 const OpenSl = struct {
     gpa: Allocator,
@@ -28,7 +27,7 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) backend.Error!backend.Opened
 
     var channels: u32 = desc.channels;
     var sample_rate: u32 = desc.sample_rate;
-    const output = c.fx_audio_opensl_open(mixer_backend.handleOf(opened[0]), &channels, &sample_rate) orelse
+    const output = c.fx_audio_opensl_open(mixer_backend.pullFromC, opened[0], &channels, &sample_rate) orelse
         return error.NoDevice;
     errdefer c.fx_audio_opensl_close(output);
 

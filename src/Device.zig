@@ -30,12 +30,14 @@ const wav = @import("wav.zig");
 
 const is_android = builtin.target.abi == .android;
 const is_linux_desktop = builtin.os.tag == .linux and !is_android;
+const is_web = builtin.cpu.arch.isWasm();
 
 const none_backend = @import("backend/none.zig");
 const mixer_backend = @import("backend/mixer.zig");
 const wasapi_backend = if (builtin.os.tag == .windows) @import("backend/wasapi.zig") else void;
 const alsa_backend = if (is_linux_desktop) @import("backend/alsa.zig") else void;
 const opensl_backend = if (is_android) @import("backend/opensl.zig") else void;
+const web_backend = if (is_web) @import("backend/web.zig") else void;
 
 const Device = @This();
 
@@ -60,13 +62,16 @@ pub fn available() []const types.Backend {
         &.{ .none, .mixer, .alsa }
     else if (is_android)
         &.{ .none, .mixer, .opensl }
+    else if (is_web)
+        &.{ .none, .mixer, .web }
     else
         &.{ .none, .mixer };
 }
 
 /// How to open one of the backends this build brings, or null if it does not
 /// bring it: `.wasapi` off Windows, `.alsa` off desktop Linux, `.opensl` off
-/// Android, and `.other`, which is whatever a caller supplies.
+/// Android, `.web` out of the browser, and `.other`, which is whatever a
+/// caller supplies.
 ///
 /// A program that keeps its backends in a registry registers these by `name`.
 pub fn opener(which: types.Backend) ?backend.Opener {
@@ -76,6 +81,7 @@ pub fn opener(which: types.Backend) ?backend.Opener {
         .wasapi => if (builtin.os.tag == .windows) .{ .name = "wasapi", .tag = .wasapi, .open = wasapi_backend.open } else null,
         .alsa => if (is_linux_desktop) .{ .name = "alsa", .tag = .alsa, .open = alsa_backend.open } else null,
         .opensl => if (is_android) .{ .name = "opensl", .tag = .opensl, .open = opensl_backend.open } else null,
+        .web => if (is_web) .{ .name = "web", .tag = .web, .open = web_backend.open } else null,
         .other => null,
     };
 }

@@ -14,30 +14,21 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libcpp = true,
+        .link_libc = true,
         .imports = &.{
             .{ .name = "fluxion_id", .module = id.module("fluxion_id") },
         },
     });
 
-    // The vendored mixer graph and its C boundary (`native/bridge.h`,
-    // brought into Zig with `@cImport` rather than hand-written `extern`
-    // declarations). Everything else in the module only ever sees the safe
-    // Zig API in `Device.zig` - none of this is exported from the module.
+    // The page's half of the `web` backend: `src/backend/web.js`, which a
+    // program that runs in a browser installs beside its module as
+    // `fluxion-audio.js`. Taken by name: dep.namedLazyPath("fluxion-audio.js").
+    b.addNamedLazyPath("fluxion-audio.js", b.path("src/backend/web.js"));
+
+    // The two decoders the mixer reads compressed clips with, as C - the
+    // mixer itself is Zig (`src/mixer`), on every target, the browser too.
     mod.addIncludePath(b.path("src/native"));
-    mod.addCSourceFiles(.{
-        .files = &.{
-            "src/native/mixer/Bus.cpp",
-            "src/native/mixer/Mixer.cpp",
-            "src/native/mixer/Stream.cpp",
-            "src/native/clips/PcmClip.cpp",
-            "src/native/clips/VorbisClip.cpp",
-            "src/native/clips/Mp3Clip.cpp",
-            "src/native/clips/OscillatorClip.cpp",
-            "src/native/bridge.cpp",
-        },
-        .flags = &.{"-std=c++17"},
-    });
+    mod.addCSourceFiles(.{ .files = &.{ "src/native/vorbis.c", "src/native/mp3.c" } });
 
     // The `wasapi` backend's COM calls - a base OS component on every
     // Windows install, so this is a plain link rather than the dynamic
@@ -52,10 +43,12 @@ pub fn build(b: *std.Build) void {
     const is_android = target.result.abi == .android;
     const is_linux_desktop = target.result.os.tag == .linux and !is_android;
     if (is_linux_desktop) {
+        mod.link_libcpp = true;
         mod.addCSourceFiles(.{ .files = &.{"src/native/backends/alsa.cpp"}, .flags = &.{"-std=c++17"} });
         mod.linkSystemLibrary("dl", .{});
     }
     if (is_android) {
+        mod.link_libcpp = true;
         mod.addCSourceFiles(.{ .files = &.{"src/native/backends/opensl.cpp"}, .flags = &.{"-std=c++17"} });
         mod.linkSystemLibrary("OpenSLES", .{});
     }

@@ -29,18 +29,38 @@ try device.seek(voice, 0);
 const status = device.status(voice); // playing, position in seconds, and how often it ended
 ```
 
-Four backends today: `none`, which opens on every machine and plays
-nothing, for the tests that need no sound device; `mixer`, the real graph -
-a bus per voice with its own gain, pan and pitch-shift, mixing into a buffer
-a caller pulls by hand, which is what the other three are built on; `wasapi`
-(Windows only), which pumps that same graph to the sound card from its own
-thread; and `alsa`/`opensl` (Linux and Android), each doing the same on
-their own platform. `zig build example-tone` plays a second of tone through
+The backends: `none`, which opens on every machine and plays nothing, for
+the tests that need no sound device; `mixer`, the real graph - a bus per voice
+with its own gain, pan and pitch-shift, mixing into a buffer a caller pulls by
+hand, which is what the rest are built on; `wasapi` (Windows only), which
+pumps that same graph to the sound card from its own thread; `alsa`/`opensl`
+(Linux and Android), each doing the same on their own platform; and `web`, a
+browser's Web Audio. `zig build example-tone` plays a second of tone through
 it.
 
-The three output backends are the `mixer` backend with an `Output` attached
-to it - the thread of their own that pulls from the graph and feeds the sound
-card - so every call but opening and closing is the mixer's.
+The output backends are the `mixer` backend with an `Output` attached to it -
+what pulls from the graph and feeds the sound card - so every call but opening
+and closing is the mixer's.
+
+**In a browser.** The target is `wasm32-wasi` (the decoders are C, and want a C
+library). A page has one thread for the program, so nothing mixes on a thread
+of its own: `fluxion-audio.js` - `src/backend/web.js`, which a dependant takes
+from the build as `dep.namedLazyPath("fluxion-audio.js")` and installs beside
+its module - keeps an AudioWorklet about 60 ms ahead, calling the module's
+`fluxion_audio_pull` between the page's frames. It is one more glue for the
+platform's:
+
+```js
+import { Platform } from "./fluxion-platform.js";
+import { Audio } from "./fluxion-audio.js";
+
+await new Platform({ canvas }).run("./game.wasm", { with: [new Audio()] });
+```
+
+A page may make no sound until the person on it has pressed something, so it
+starts silent and begins on the first key, button or finger. Until then the
+graph is pulled by the clock and what it gives is thrown away: a voice still
+plays out, and says so, in its own time.
 
 **ALSA is opened, not linked.** The `alsa` backend loads `libasound.so.2`
 when its first output opens, so a Linux build needs neither its headers nor
@@ -91,26 +111,24 @@ A voice can also feed a submix instead of the master bus directly -
 `PlayDesc.output` to route a voice into one, and submixes can feed each
 other before either reaches the master.
 
-**Where the mixing logic comes from.** The bus graph, the resampling and
-channel conversion, and the PCM and Ogg Vorbis decoders are a proven,
-from-scratch real-time audio engine, not something built here from a blank
-page - compiled as native C++ through Zig's own C++ toolchain and never
-exposed past `Device`. Nothing outside `src/native/` touches a raw pointer
-or an unsafe cast; the handles a program holds are eight bytes from
-`fluxion-id`, same as everywhere else in this ecosystem. The pitch-shift DSP
-that came with it is wired to its own processor now, one `smb::PitchShift`
-per channel on the voice bus, alongside gain and pan - set through
-`PlayDesc.pitch` or `Device.setPitch`, a no-op at `1.0` that skips the FFT
-round trip entirely.
+**The mixer is Zig, on every target** (`src/mixer`): the bus graph, the
+resampling and channel conversion, the clips and the processors, and one queue
+of changes between the thread that calls `Device` and the one that mixes -
+the only seam between them. The handles a program holds are eight bytes from
+`fluxion-id`, same as everywhere else in this ecosystem. The pitch shift is a
+phase vocoder, one per channel on the voice bus, alongside gain and pan - set
+through `PlayDesc.pitch` or `Device.setPitch`, a no-op at `1.0` that skips the
+FFT round trip entirely. What is C is the two decoders (`src/native/vorbis.c`
+and `mp3.c`); what is C++ is the ALSA and OpenSL ES outputs, which call the
+mixer back through `src/native/output.h`.
 
 ## License
 
 This package is CC0-1.0 (see `LICENSE`) - public domain, no attribution
-required. Three files under `src/native/third_party/` are someone else's work
-and keep their own license, unmodified:
+required. Three pieces are someone else's work and keep their own license:
 
 | File | What it is | License |
 | --- | --- | --- |
-| `stb_vorbis.c` | The Ogg Vorbis decoder `VorbisClip` decodes through. | MIT (Copyright (c) 2017 Sean Barrett) - one of two licenses it ships under; this project uses the MIT one. |
-| `smbPitchShift.hpp` | The phase-vocoder pitch shifter behind the pitch-shift processor. | The Wide Open License (Copyright 1999-2015 Stephan M. Bernsee) |
-| `minimp3.h` | The MP3 decoder `Mp3Clip` decodes through ([lieff/minimp3](https://github.com/lieff/minimp3)). | CC0-1.0 |
+| `src/native/third_party/stb_vorbis.c` | The Ogg Vorbis decoder, unmodified. | MIT (Copyright (c) 2017 Sean Barrett) - one of two licenses it ships under; this project uses the MIT one. |
+| `src/native/third_party/minimp3.h` | The MP3 decoder, unmodified ([lieff/minimp3](https://github.com/lieff/minimp3)). | CC0-1.0 |
+| `src/mixer/effects.zig` (`Shifter`) | `smbPitchShift` 1.2 carried over to Zig, the pitch-shift processor. Its notice is kept beside it. | The Wide Open License (Copyright 1999-2015 Stephan M. Bernsee) |

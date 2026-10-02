@@ -3,9 +3,9 @@
 #ifndef FLUXION_AUDIO_BACKENDS_OPENSL_HPP
 #define FLUXION_AUDIO_BACKENDS_OPENSL_HPP
 
-#include <cstdint>
+#include "../output.h"
 
-struct fx_audio_mixer;
+#include <cstdint>
 
 namespace fluxion_audio::opensl
 {
@@ -15,7 +15,7 @@ namespace fluxion_audio::opensl
     // re-enqueuing a fresh buffer every time the last one finishes. Null on
     // failure. `channels` and `sample_rate` are asked for and answered with
     // what was actually opened.
-    Output *open(fx_audio_mixer *mixer, std::uint32_t *channels, std::uint32_t *sample_rate);
+    Output *open(fx_audio_pull pull, void *mixer, std::uint32_t *channels, std::uint32_t *sample_rate);
     void close(Output *output);
 }
 

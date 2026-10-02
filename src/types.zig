@@ -10,7 +10,7 @@ pub const Submix = resources.Submix;
 
 pub const Backend = enum {
     none,
-    /// The vendored mixer graph, mixing into a buffer a caller pulls by
+    /// The mixer graph, mixing into a buffer a caller pulls by
     /// hand - what every real output backend will sit behind, and what a
     /// test that wants to check actual mixed samples opens directly.
     mixer,
@@ -22,6 +22,9 @@ pub const Backend = enum {
     /// An OpenSL ES output mix, re-enqueued from its own callback. Android
     /// only.
     opensl,
+    /// Web Audio, an AudioWorklet fed between the page's frames. The
+    /// browser (`wasm32-wasi`) only.
+    web,
     /// A backend the caller supplied to `Device.initWith`, none of the ones
     /// above. `Info.name` says which it is.
     other,

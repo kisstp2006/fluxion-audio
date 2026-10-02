@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 #include "opensl.hpp"
-#include "../mixer_handle.hpp"
 
 #include <SLES/OpenSLES.h>
 #include <SLES/OpenSLES_Android.h>
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace fluxion_audio::opensl
@@ -59,7 +59,8 @@ namespace fluxion_audio::opensl
 
     struct Output
     {
-        fx_audio_mixer *mixer;
+        fx_audio_pull pull;
+        void *mixer;
         std::uint32_t channels = 2;
         std::uint32_t sample_rate = 44100;
 
@@ -84,9 +85,10 @@ namespace fluxion_audio::opensl
         }
     }
 
-    Output *open(fx_audio_mixer *mixer, std::uint32_t *channels, std::uint32_t *sample_rate)
+    Output *open(fx_audio_pull pull, void *mixer, std::uint32_t *channels, std::uint32_t *sample_rate)
     {
         auto output = std::make_unique<Output>();
+        output->pull = pull;
         output->mixer = mixer;
         output->channels = *channels != 0 ? *channels : 2;
         output->sample_rate = *sample_rate != 0 ? *sample_rate : 44100;
@@ -166,7 +168,7 @@ namespace fluxion_audio::opensl
         // queue kept fed, not a fixed period size the way ALSA does.
         const std::uint32_t frame_count = sample_rate / 50; // 20ms
         planar.resize(static_cast<std::size_t>(frame_count) * channels);
-        mixer->mixer.getSamples(frame_count, channels, sample_rate, planar);
+        pull(mixer, frame_count, channels, sample_rate, planar.data());
 
         interleaved.resize(static_cast<std::size_t>(frame_count) * channels);
         for (std::uint32_t frame = 0; frame < frame_count; ++frame)
@@ -179,4 +181,14 @@ namespace fluxion_audio::opensl
 
         (*buffer_queue)->Enqueue(buffer_queue, interleaved.data(), interleaved.size() * sizeof(std::int16_t));
     }
+}
+
+extern "C" fx_audio_output *fx_audio_opensl_open(fx_audio_pull pull, void *mixer, uint32_t *channels, uint32_t *sample_rate)
+{
+    return reinterpret_cast<fx_audio_output *>(fluxion_audio::opensl::open(pull, mixer, channels, sample_rate));
+}
+
+extern "C" void fx_audio_opensl_close(fx_audio_output *output)
+{
+    fluxion_audio::opensl::close(reinterpret_cast<fluxion_audio::opensl::Output *>(output));
 }

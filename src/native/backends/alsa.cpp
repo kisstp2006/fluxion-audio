@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 #include "alsa.hpp"
-#include "../mixer_handle.hpp"
 
 #include <atomic>
 #include <cerrno>
@@ -114,7 +113,8 @@ namespace fluxion_audio::alsa
     struct Output
     {
         const Alsa *api;
-        fx_audio_mixer *mixer;
+        fx_audio_pull pull;
+        void *mixer;
         snd_pcm_t *playback_handle = nullptr;
         unsigned int channels = 2;
         unsigned int sample_rate = 44100;
@@ -176,13 +176,14 @@ namespace fluxion_audio::alsa
         }
     }
 
-    Output *open(fx_audio_mixer *mixer, std::uint32_t *channels, std::uint32_t *sample_rate)
+    Output *open(fx_audio_pull pull, void *mixer, std::uint32_t *channels, std::uint32_t *sample_rate)
     {
         const Alsa *api = library();
         if (!api) return nullptr;
 
         auto output = std::make_unique<Output>();
         output->api = api;
+        output->pull = pull;
         output->mixer = mixer;
         output->channels = *channels != 0 ? *channels : 2;
         output->sample_rate = *sample_rate != 0 ? *sample_rate : 44100;
@@ -270,7 +271,7 @@ namespace fluxion_audio::alsa
 
             const auto frame_count = static_cast<std::uint32_t>(frames);
             planar.resize(static_cast<std::size_t>(frame_count) * channels);
-            mixer->mixer.getSamples(frame_count, channels, sample_rate, planar);
+            pull(mixer, frame_count, channels, sample_rate, planar.data());
 
             if (is_float)
             {
@@ -298,4 +299,14 @@ namespace fluxion_audio::alsa
                 api->pcm_prepare(playback_handle);
         }
     }
+}
+
+extern "C" fx_audio_output *fx_audio_alsa_open(fx_audio_pull pull, void *mixer, uint32_t *channels, uint32_t *sample_rate)
+{
+    return reinterpret_cast<fx_audio_output *>(fluxion_audio::alsa::open(pull, mixer, channels, sample_rate));
+}
+
+extern "C" void fx_audio_alsa_close(fx_audio_output *output)
+{
+    fluxion_audio::alsa::close(reinterpret_cast<fluxion_audio::alsa::Output *>(output));
 }

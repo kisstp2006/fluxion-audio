@@ -1,34 +1,35 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The vendored mixer graph, wired up so a clip is a `Data`, a voice is a
-//! `Stream` feeding its own bus (with a gain, a pan and a pitch-shift
-//! processor on it) into the master bus. `Device.mix` pulls the result.
+//! The mixer graph (`mixer/Graph.zig`), wired up so a clip is a `Data`, a
+//! voice is a `Stream` feeding its own bus (with a gain, a pan and a
+//! pitch-shift processor on it) into the master bus. `Device.mix` pulls the
+//! result.
 //!
 //! On its own it writes to no sound device. The output backends - `wasapi`,
-//! `alsa`, `opensl` - are this graph with an `Output` attached: the thread
-//! of their own that pulls from it and feeds the sound card, closed before
-//! the graph goes. Every other call is this file's.
+//! `alsa`, `opensl`, `web` - are this graph with an `Output` attached: what
+//! pulls from it and feeds the sound card, on a thread of its own or as the
+//! browser asks, closed before the graph goes. Every other call is this
+//! file's.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const types = @import("../types.zig");
 const backend = @import("../backend.zig");
-const native = @import("../native.zig");
-const c = native.c;
+const Graph = @import("../mixer/Graph.zig");
 
-/// A sound device fed from the graph on a thread of its own.
+/// A sound device fed from the graph.
 pub const Output = struct {
     context: *anyopaque,
-    /// Stops the thread and lets the device go.
+    /// Stops what pulls, and lets the device go.
     close: *const fn (context: *anyopaque) void,
     info: types.Info,
 };
 
 const Mixer = struct {
     gpa: Allocator,
-    handle: *c.fx_audio_mixer,
-    master_bus_id: usize,
+    graph: Graph,
+    master_bus_id: Graph.Id,
     output: ?Output = null,
 };
 
@@ -37,47 +38,60 @@ const Mixer = struct {
 /// and pitch-shift, and those three processors - and what the stream says
 /// of itself as it plays.
 const Voice = struct {
-    stream_id: usize,
-    bus_id: usize,
-    gain_id: usize,
-    pan_id: usize,
-    pitch_id: usize,
-    state: *c.fx_audio_voice_state,
+    // Zero until made, so a voice half made can be let go of like a whole one.
+    stream_id: Graph.Id = 0,
+    bus_id: Graph.Id = 0,
+    gain_id: Graph.Id = 0,
+    pan_id: Graph.Id = 0,
+    pitch_id: Graph.Id = 0,
+    state: ?*Graph.VoiceState = null,
+
+    /// Every object of it out of the graph, and its hold on its state let go.
+    fn forget(self: *Voice, graph: *Graph) void {
+        for ([_]Graph.Id{ self.pitch_id, self.pan_id, self.gain_id, self.bus_id, self.stream_id }) |id| {
+            if (id != 0) graph.delete(id);
+        }
+        if (self.state) |state| state.release(graph.gpa);
+    }
 };
 
 /// A submix: a bus of its own with a gain processor for its volume, feeding
 /// the master bus or another submix.
 const Submix = struct {
-    bus_id: usize,
-    gain_id: usize,
+    bus_id: Graph.Id,
+    gain_id: Graph.Id,
 };
 
 pub fn open(gpa: Allocator, desc: types.DeviceDesc) backend.Error!backend.Opened {
     _ = desc;
-    const handle = c.fx_audio_mixer_create() orelse return error.Failed;
-    errdefer c.fx_audio_mixer_destroy(handle);
-
-    const master_bus_id = c.fx_audio_mixer_next_id(handle);
-    c.fx_audio_mixer_init_bus(handle, master_bus_id);
-    c.fx_audio_mixer_set_master_bus(handle, master_bus_id);
-
     const self = try gpa.create(Mixer);
-    self.* = .{ .gpa = gpa, .handle = handle, .master_bus_id = master_bus_id };
+    errdefer gpa.destroy(self);
+    self.* = .{ .gpa = gpa, .graph = .init(gpa), .master_bus_id = 0 };
+    errdefer self.graph.deinit();
+
+    self.master_bus_id = self.graph.nextId();
+    try self.graph.submit(.{ .init_bus = self.master_bus_id });
+    try self.graph.submit(.{ .set_master_bus = self.master_bus_id });
     return .{ self, &vtable };
 }
 
-/// Hand the graph `impl` - one `open` returned - to a sound device's thread:
-/// from here `Device.mix` leaves its buffer alone, and the device is closed
-/// with the graph.
+/// Hand the graph `impl` - one `open` returned - to a sound device: from here
+/// `Device.mix` leaves its buffer alone, and the device is closed with the
+/// graph.
 pub fn attach(impl: backend.Impl, output: Output) void {
     cast(impl).output = output;
 }
 
-/// Mix into `out` for a sound device: what an `Output`'s thread calls.
+/// Mix into `out` for a sound device: what an `Output` calls.
 pub fn pull(impl: backend.Impl, channels: u32, sample_rate: u32, out: []f32) void {
     const self = cast(impl);
-    const frames: u32 = @intCast(out.len / channels);
-    c.fx_audio_mixer_get_samples(self.handle, frames, channels, sample_rate, out.ptr);
+    self.graph.getSamples(@intCast(out.len / channels), channels, sample_rate, out);
+}
+
+/// `pull`, for a device written in C: `impl` as the context, and `frames`
+/// frames of `channels` into `out`, planar by channel.
+pub fn pullFromC(impl: ?*anyopaque, frames: u32, channels: u32, sample_rate: u32, out: [*c]f32) callconv(.c) void {
+    pull(impl.?, channels, sample_rate, out[0 .. @as(usize, frames) * channels]);
 }
 
 const vtable: backend.Vtable = .{
@@ -108,18 +122,11 @@ fn cast(impl: backend.Impl) *Mixer {
     return @ptrCast(@alignCast(impl));
 }
 
-/// The raw handle underneath, for an output backend (`alsa`, `opensl`) that
-/// pulls samples directly rather than through `Device.mix`. `impl` must be
-/// one this file's `open` returned.
-pub fn handleOf(impl: backend.Impl) *c.fx_audio_mixer {
-    return cast(impl).handle;
-}
-
 fn deinit(impl: backend.Impl) void {
     const self = cast(impl);
-    // The device's thread reads the graph: it stops first.
+    // The device reads the graph: it stops first.
     if (self.output) |output| output.close(output.context);
-    c.fx_audio_mixer_destroy(self.handle);
+    self.graph.deinit();
     self.gpa.destroy(self);
 }
 
@@ -131,19 +138,16 @@ fn info(impl: backend.Impl) types.Info {
 
 fn loadClip(impl: backend.Impl, desc: types.ClipDesc) backend.Error!backend.Loaded {
     const self = cast(impl);
-    const data_id = c.fx_audio_mixer_next_id(self.handle);
-
-    switch (desc.format) {
-        .pcm_s16 => {
+    const data: *Graph.Data = switch (desc.format) {
+        .pcm_s16 => blk: {
             // Interleaved S16, byte-aligned and not necessarily i16-aligned,
             // deinterleaved into the mixer's own planar-float layout - int16
-            // min/max is asymmetric, so this scales by 32768 both ways
-            // rather than by the max positive value, which keeps -1.0
-            // reachable.
+            // min/max is asymmetric, so this scales by 32768 both ways rather
+            // than by the max positive value, which keeps -1.0 reachable.
             const channels = desc.channels;
             const frame_count = desc.bytes.len / 2 / channels;
 
-            const planar = self.gpa.alloc(f32, frame_count * channels) catch return error.OutOfMemory;
+            const planar = try self.gpa.alloc(f32, frame_count * channels);
             defer self.gpa.free(planar);
 
             for (0..frame_count) |frame| {
@@ -153,91 +157,72 @@ fn loadClip(impl: backend.Impl, desc: types.ClipDesc) backend.Error!backend.Load
                     planar[channel * frame_count + frame] = @as(f32, @floatFromInt(sample)) / 32768.0;
                 }
             }
-
-            c.fx_audio_mixer_init_data_pcm_f32(self.handle, data_id, @intCast(channels), desc.sample_rate, planar.ptr, frame_count);
-            return .{ .native = @ptrFromInt(data_id), .info = .{ .channels = channels, .sample_rate = desc.sample_rate, .frames = frame_count } };
+            break :blk try Graph.Data.initPcm(self.gpa, channels, desc.sample_rate, planar);
         },
-        .pcm_f32 => {
-            const frame_count = desc.samples.len / desc.channels;
-            c.fx_audio_mixer_init_data_pcm_f32(self.handle, data_id, @intCast(desc.channels), desc.sample_rate, desc.samples.ptr, frame_count);
-            return .{ .native = @ptrFromInt(data_id), .info = .{ .channels = desc.channels, .sample_rate = desc.sample_rate, .frames = frame_count } };
-        },
-        .vorbis, .mp3 => {
-            var said: c.fx_audio_clip_info = undefined;
-            const failed = if (desc.format == .vorbis)
-                c.fx_audio_mixer_init_data_vorbis(self.handle, data_id, desc.bytes.ptr, desc.bytes.len, &said)
-            else
-                c.fx_audio_mixer_init_data_mp3(self.handle, data_id, desc.bytes.ptr, desc.bytes.len, &said);
-            if (failed != 0) return error.DecodeFailed;
-            return .{ .native = @ptrFromInt(data_id), .info = .{ .channels = said.channels, .sample_rate = said.sample_rate, .frames = said.frames } };
-        },
+        .pcm_f32 => try Graph.Data.initPcm(self.gpa, desc.channels, desc.sample_rate, desc.samples),
+        .vorbis => try Graph.Data.initVorbis(self.gpa, desc.bytes),
+        .mp3 => try Graph.Data.initMp3(self.gpa, desc.bytes),
         .wav => unreachable,
-    }
+    };
+    const said: types.ClipInfo = .{ .channels = data.channels, .sample_rate = data.sample_rate, .frames = data.frames() };
+    const data_id = self.graph.nextId();
+    try self.graph.submit(.{ .init_data = .{ .id = data_id, .data = data } });
+    return .{ .native = @ptrFromInt(data_id), .info = said };
 }
 
 fn loadOscillator(impl: backend.Impl, desc: types.OscillatorDesc) backend.Error!backend.Loaded {
     const self = cast(impl);
-    const data_id = c.fx_audio_mixer_next_id(self.handle);
-
-    const native_type: c.fx_audio_oscillator_type = switch (desc.type) {
-        .sine => c.FX_AUDIO_OSCILLATOR_SINE,
-        .square => c.FX_AUDIO_OSCILLATOR_SQUARE,
-        .sawtooth => c.FX_AUDIO_OSCILLATOR_SAWTOOTH,
-        .triangle => c.FX_AUDIO_OSCILLATOR_TRIANGLE,
-    };
-    c.fx_audio_mixer_init_data_oscillator(
-        self.handle,
-        data_id,
-        native_type,
-        desc.frequency,
-        desc.amplitude,
-        desc.length,
-        desc.sample_rate,
-    );
-
+    const data = try Graph.Data.initOscillator(self.gpa, desc);
+    const data_id = self.graph.nextId();
+    try self.graph.submit(.{ .init_data = .{ .id = data_id, .data = data } });
     return .{ .native = @ptrFromInt(data_id), .info = .{ .channels = 1, .sample_rate = desc.sample_rate, .frames = types.oscillatorFrames(desc) } };
 }
 
 fn unloadClip(impl: backend.Impl, native_clip: backend.Native) void {
-    const self = cast(impl);
-    c.fx_audio_mixer_delete_object(self.handle, @intFromPtr(native_clip));
+    cast(impl).graph.delete(@intFromPtr(native_clip));
 }
 
 fn play(impl: backend.Impl, clip: backend.Native, output: ?backend.Native, desc: types.PlayDesc, start: u64) backend.Error!backend.Native {
     const self = cast(impl);
+    const graph = &self.graph;
     const data_id = @intFromPtr(clip);
-    const output_bus_id: usize = if (output) |o| asSubmix(o).bus_id else self.master_bus_id;
+    const output_bus_id = if (output) |o| asSubmix(o).bus_id else self.master_bus_id;
 
     const voice = try self.gpa.create(Voice);
     errdefer self.gpa.destroy(voice);
+    voice.* = .{};
+    errdefer voice.forget(graph);
 
-    voice.stream_id = c.fx_audio_mixer_next_id(self.handle);
-    voice.state = c.fx_audio_mixer_init_stream(self.handle, voice.stream_id, data_id) orelse return error.OutOfMemory;
+    voice.stream_id = graph.nextId();
+    const state = try graph.initStream(voice.stream_id, data_id);
+    voice.state = state;
 
-    voice.bus_id = c.fx_audio_mixer_next_id(self.handle);
-    c.fx_audio_mixer_init_bus(self.handle, voice.bus_id);
-    c.fx_audio_mixer_set_stream_output(self.handle, voice.stream_id, voice.bus_id);
-    c.fx_audio_mixer_set_bus_output(self.handle, voice.bus_id, output_bus_id);
+    voice.bus_id = graph.nextId();
+    try graph.submit(.{ .init_bus = voice.bus_id });
+    graph.send(.{ .set_stream_output = .{ .id = voice.stream_id, .bus = voice.bus_id } });
+    graph.send(.{ .set_bus_output = .{ .bus = voice.bus_id, .output = output_bus_id } });
 
-    voice.gain_id = c.fx_audio_mixer_next_id(self.handle);
-    c.fx_audio_mixer_init_gain(self.handle, voice.gain_id, desc.volume);
-    c.fx_audio_mixer_add_processor(self.handle, voice.bus_id, voice.gain_id);
+    voice.gain_id = try processor(graph, voice.bus_id, .{ .gain = desc.volume });
+    voice.pan_id = try processor(graph, voice.bus_id, .{ .pan = desc.pan });
+    voice.pitch_id = try processor(graph, voice.bus_id, .{ .pitch = .{ .pitch = desc.pitch } });
 
-    voice.pan_id = c.fx_audio_mixer_next_id(self.handle);
-    c.fx_audio_mixer_init_pan(self.handle, voice.pan_id, desc.pan);
-    c.fx_audio_mixer_add_processor(self.handle, voice.bus_id, voice.pan_id);
-
-    voice.pitch_id = c.fx_audio_mixer_next_id(self.handle);
-    c.fx_audio_mixer_init_pitch_shift(self.handle, voice.pitch_id, desc.pitch);
-    c.fx_audio_mixer_add_processor(self.handle, voice.bus_id, voice.pitch_id);
-
-    if (desc.loop) c.fx_audio_mixer_set_stream_looping(self.handle, voice.stream_id, 1);
-    if (desc.speed != 1) c.fx_audio_mixer_set_stream_speed(self.handle, voice.stream_id, @max(desc.speed, 0.01));
-    if (start > 0) c.fx_audio_mixer_seek_stream(self.handle, voice.stream_id, start);
-    if (!desc.paused) c.fx_audio_mixer_play_stream(self.handle, voice.stream_id);
-    c.fx_audio_voice_state_expect(voice.state, @intFromBool(!desc.paused), start);
+    if (desc.loop) graph.send(.{ .set_stream_looping = .{ .id = voice.stream_id, .looping = true } });
+    if (desc.speed != 1) graph.send(.{ .set_stream_speed = .{ .id = voice.stream_id, .speed = @max(desc.speed, 0.01) } });
+    if (start > 0) graph.send(.{ .seek_stream = .{ .id = voice.stream_id, .frame = start } });
+    if (!desc.paused) graph.send(.{ .play_stream = voice.stream_id });
+    state.expect(!desc.paused, start);
 
     return voice;
+}
+
+/// A processor of `kind` made, and put on bus `bus_id`.
+fn processor(graph: *Graph, bus_id: Graph.Id, kind: Graph.Processor.Kind) backend.Error!Graph.Id {
+    const made = try Graph.Processor.create(graph.gpa, kind);
+    const id = graph.nextId();
+    errdefer graph.delete(id);
+    try graph.submit(.{ .init_processor = .{ .id = id, .processor = made } });
+    graph.send(.{ .add_processor = .{ .bus = bus_id, .processor = id } });
+    return id;
 }
 
 fn asVoice(native_voice: backend.Native) *Voice {
@@ -247,70 +232,58 @@ fn asVoice(native_voice: backend.Native) *Voice {
 fn stopVoice(impl: backend.Impl, native_voice: backend.Native) void {
     const self = cast(impl);
     const voice = asVoice(native_voice);
-    c.fx_audio_mixer_delete_object(self.handle, voice.pitch_id);
-    c.fx_audio_mixer_delete_object(self.handle, voice.pan_id);
-    c.fx_audio_mixer_delete_object(self.handle, voice.gain_id);
-    c.fx_audio_mixer_delete_object(self.handle, voice.bus_id);
-    c.fx_audio_mixer_delete_object(self.handle, voice.stream_id);
-    c.fx_audio_voice_state_release(voice.state);
+    voice.forget(&self.graph);
     self.gpa.destroy(voice);
 }
 
 fn setVoiceVolume(impl: backend.Impl, native_voice: backend.Native, volume: f32) void {
-    const self = cast(impl);
-    c.fx_audio_mixer_set_gain(self.handle, asVoice(native_voice).gain_id, volume);
+    cast(impl).graph.send(.{ .set_gain = .{ .id = asVoice(native_voice).gain_id, .value = volume } });
 }
 
 fn setVoicePan(impl: backend.Impl, native_voice: backend.Native, pan: f32) void {
-    const self = cast(impl);
-    c.fx_audio_mixer_set_pan(self.handle, asVoice(native_voice).pan_id, pan);
+    cast(impl).graph.send(.{ .set_pan = .{ .id = asVoice(native_voice).pan_id, .value = pan } });
 }
 
 fn setVoicePitch(impl: backend.Impl, native_voice: backend.Native, pitch: f32) void {
-    const self = cast(impl);
-    c.fx_audio_mixer_set_pitch_shift(self.handle, asVoice(native_voice).pitch_id, pitch);
+    cast(impl).graph.send(.{ .set_pitch = .{ .id = asVoice(native_voice).pitch_id, .value = pitch } });
 }
 
 fn setVoiceSpeed(impl: backend.Impl, native_voice: backend.Native, speed: f32) void {
-    const self = cast(impl);
-    c.fx_audio_mixer_set_stream_speed(self.handle, asVoice(native_voice).stream_id, speed);
+    cast(impl).graph.send(.{ .set_stream_speed = .{ .id = asVoice(native_voice).stream_id, .speed = speed } });
 }
 
 fn setVoiceLooping(impl: backend.Impl, native_voice: backend.Native, looping: bool) void {
-    const self = cast(impl);
-    c.fx_audio_mixer_set_stream_looping(self.handle, asVoice(native_voice).stream_id, @intFromBool(looping));
+    cast(impl).graph.send(.{ .set_stream_looping = .{ .id = asVoice(native_voice).stream_id, .looping = looping } });
 }
 
 fn setVoicePaused(impl: backend.Impl, native_voice: backend.Native, paused: bool) void {
     const self = cast(impl);
     const voice = asVoice(native_voice);
     if (paused) {
-        c.fx_audio_mixer_stop_stream(self.handle, voice.stream_id, 0);
-    } else c.fx_audio_mixer_play_stream(self.handle, voice.stream_id);
-    c.fx_audio_voice_state_expect(voice.state, @intFromBool(!paused), c.fx_audio_voice_state_frame(voice.state));
+        self.graph.send(.{ .stop_stream = .{ .id = voice.stream_id, .reset = false } });
+    } else self.graph.send(.{ .play_stream = voice.stream_id });
+    const state = voice.state.?;
+    state.expect(!paused, state.frame());
 }
 
 fn seekVoice(impl: backend.Impl, native_voice: backend.Native, frame: u64) void {
     const self = cast(impl);
     const voice = asVoice(native_voice);
-    c.fx_audio_mixer_seek_stream(self.handle, voice.stream_id, frame);
-    c.fx_audio_voice_state_expect(voice.state, c.fx_audio_voice_state_playing(voice.state), frame);
+    self.graph.send(.{ .seek_stream = .{ .id = voice.stream_id, .frame = frame } });
+    const state = voice.state.?;
+    state.expect(state.playing(), frame);
 }
 
 fn setVoiceOutput(impl: backend.Impl, native_voice: backend.Native, output: ?backend.Native) void {
     const self = cast(impl);
-    const output_bus_id: usize = if (output) |o| asSubmix(o).bus_id else self.master_bus_id;
-    c.fx_audio_mixer_set_bus_output(self.handle, asVoice(native_voice).bus_id, output_bus_id);
+    const output_bus_id = if (output) |o| asSubmix(o).bus_id else self.master_bus_id;
+    self.graph.send(.{ .set_bus_output = .{ .bus = asVoice(native_voice).bus_id, .output = output_bus_id } });
 }
 
 fn voiceStatus(impl: backend.Impl, native_voice: backend.Native) backend.Status {
     _ = impl;
-    const state = asVoice(native_voice).state;
-    return .{
-        .playing = c.fx_audio_voice_state_playing(state) != 0,
-        .frame = c.fx_audio_voice_state_frame(state),
-        .ends = c.fx_audio_voice_state_ends(state),
-    };
+    const state = asVoice(native_voice).state.?;
+    return .{ .playing = state.playing(), .frame = state.frame(), .ends = state.ends() };
 }
 
 fn asSubmix(native_submix: backend.Native) *Submix {
@@ -319,43 +292,39 @@ fn asSubmix(native_submix: backend.Native) *Submix {
 
 fn createSubmix(impl: backend.Impl, output: ?backend.Native, volume: f32) backend.Error!backend.Native {
     const self = cast(impl);
-    const output_bus_id: usize = if (output) |o| asSubmix(o).bus_id else self.master_bus_id;
+    const output_bus_id = if (output) |o| asSubmix(o).bus_id else self.master_bus_id;
 
     const submix = try self.gpa.create(Submix);
     errdefer self.gpa.destroy(submix);
 
-    submix.bus_id = c.fx_audio_mixer_next_id(self.handle);
-    c.fx_audio_mixer_init_bus(self.handle, submix.bus_id);
-    c.fx_audio_mixer_set_bus_output(self.handle, submix.bus_id, output_bus_id);
-
-    submix.gain_id = c.fx_audio_mixer_next_id(self.handle);
-    c.fx_audio_mixer_init_gain(self.handle, submix.gain_id, volume);
-    c.fx_audio_mixer_add_processor(self.handle, submix.bus_id, submix.gain_id);
-
+    submix.bus_id = self.graph.nextId();
+    errdefer self.graph.delete(submix.bus_id);
+    try self.graph.submit(.{ .init_bus = submix.bus_id });
+    self.graph.send(.{ .set_bus_output = .{ .bus = submix.bus_id, .output = output_bus_id } });
+    submix.gain_id = try processor(&self.graph, submix.bus_id, .{ .gain = volume });
     return submix;
 }
 
 fn destroySubmix(impl: backend.Impl, native_submix: backend.Native) void {
     const self = cast(impl);
     const submix = asSubmix(native_submix);
-    c.fx_audio_mixer_delete_object(self.handle, submix.gain_id);
-    c.fx_audio_mixer_delete_object(self.handle, submix.bus_id);
+    self.graph.delete(submix.gain_id);
+    self.graph.delete(submix.bus_id);
     self.gpa.destroy(submix);
 }
 
 fn setSubmixVolume(impl: backend.Impl, native_submix: backend.Native, volume: f32) void {
-    const self = cast(impl);
-    c.fx_audio_mixer_set_gain(self.handle, asSubmix(native_submix).gain_id, volume);
+    cast(impl).graph.send(.{ .set_gain = .{ .id = asSubmix(native_submix).gain_id, .value = volume } });
 }
 
 fn setSubmixOutput(impl: backend.Impl, native_submix: backend.Native, output: ?backend.Native) void {
     const self = cast(impl);
-    const output_bus_id: usize = if (output) |o| asSubmix(o).bus_id else self.master_bus_id;
-    c.fx_audio_mixer_set_bus_output(self.handle, asSubmix(native_submix).bus_id, output_bus_id);
+    const output_bus_id = if (output) |o| asSubmix(o).bus_id else self.master_bus_id;
+    self.graph.send(.{ .set_bus_output = .{ .bus = asSubmix(native_submix).bus_id, .output = output_bus_id } });
 }
 
-/// With a sound device attached, its thread is the one that pulls, and
-/// `out` is left as it is rather than racing it.
+/// With a sound device attached, it is the one that pulls, and `out` is
+/// left as it is rather than racing it.
 fn mix(impl: backend.Impl, channels: u32, sample_rate: u32, out: []f32) void {
     if (cast(impl).output != null) return;
     pull(impl, channels, sample_rate, out);
