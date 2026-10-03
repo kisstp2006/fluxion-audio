@@ -25,6 +25,10 @@ pub fn build(b: *std.Build) void {
     // `fluxion-audio.js`. Taken by name: dep.namedLazyPath("fluxion-audio.js").
     b.addNamedLazyPath("fluxion-audio.js", b.path("src/backend/web.js"));
 
+    // stb_vorbis's licence, the Unlicense, for a program that lists what is
+    // built into it: dep.namedLazyPath("stb_vorbis.txt").
+    b.addNamedLazyPath("stb_vorbis.txt", b.path("src/native/third_party/stb_vorbis-UNLICENSE.txt"));
+
     // The two decoders the mixer reads compressed clips with, as C - the
     // mixer itself is Zig (`src/mixer`), on every target, the browser too.
     mod.addIncludePath(b.path("src/native"));

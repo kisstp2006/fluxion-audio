@@ -129,6 +129,6 @@ required. Three pieces are someone else's work and keep their own license:
 
 | File | What it is | License |
 | --- | --- | --- |
-| `src/native/third_party/stb_vorbis.c` | The Ogg Vorbis decoder, unmodified. | MIT (Copyright (c) 2017 Sean Barrett) - one of two licenses it ships under; this project uses the MIT one. |
+| `src/native/third_party/stb_vorbis.c` | The Ogg Vorbis decoder, unmodified. | The Unlicense (public domain) - one of the two licences it ships under, the MIT one the other; this project uses the Unlicense. Its text is in `stb_vorbis-UNLICENSE.txt` beside it, which the build hands on as `stb_vorbis.txt` for a program's notices. |
 | `src/native/third_party/minimp3.h` | The MP3 decoder, unmodified ([lieff/minimp3](https://github.com/lieff/minimp3)). | CC0-1.0 |
 | `src/mixer/effects.zig` (`Shifter`) | `smbPitchShift` 1.2 carried over to Zig, the pitch-shift processor. Its notice is kept beside it. | The Wide Open License (Copyright 1999-2015 Stephan M. Bernsee) |
