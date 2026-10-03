@@ -192,9 +192,11 @@ export class Audio {
     }
   }
 
-  /// `frames` mixed by the module, as a view of its memory.
+  /// `frames` mixed by the module, as a view of its memory. Its address
+  /// comes back signed, negative past 2 GB, and is read as the unsigned one
+  /// it is.
   pull(output, frames) {
-    const pointer = this.exports.fluxion_audio_pull(output.mixer, frames);
+    const pointer = this.exports.fluxion_audio_pull(output.mixer, frames) >>> 0;
     return new Float32Array(this.memory.buffer, pointer, frames * output.channels);
   }
 }
