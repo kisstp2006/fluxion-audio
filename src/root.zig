@@ -64,5 +64,7 @@ test {
     _ = wav;
     _ = @import("backend/none.zig");
     _ = @import("backend/mixer.zig");
-    if (@import("builtin").os.tag == .windows) _ = @import("backend/wasapi.zig");
+    const builtin = @import("builtin");
+    if (builtin.os.tag == .windows) _ = @import("backend/wasapi.zig");
+    if (builtin.os.tag == .linux and !builtin.abi.isAndroid()) _ = @import("backend/alsa.zig");
 }

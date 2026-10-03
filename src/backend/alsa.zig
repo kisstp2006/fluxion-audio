@@ -4,10 +4,9 @@
 //! vendored C++ in `native/backends/alsa.cpp` rather than by this file -
 //! unlike `wasapi.zig`, there is no Zig-side loop here at all. It is the
 //! `mixer` backend with this attached as its `Output`, as `wasapi.zig` is.
-//!
-//! Untested on this machine: there is no ALSA here to open. Building this
-//! file only proves it compiles against the vendored headers, not that it
-//! plays anything.
+//! The test below plays on whatever the default device is - the null device
+//! under WSL, which takes sound as fast as it is given and so is the one a
+//! clock has to pace - and skips itself where ALSA will not open.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -46,4 +45,27 @@ fn close(context: *anyopaque) void {
     const self: *Alsa = @ptrCast(@alignCast(context));
     c.fx_audio_alsa_close(self.output);
     self.gpa.destroy(self);
+}
+
+// -------------------------------------------------------------------------
+// Tests - on this machine's default device, when ALSA opens one
+// -------------------------------------------------------------------------
+
+const testing = std.testing;
+const Device = @import("../Device.zig");
+
+test "a voice on the default device moves on with the clock, and no further ahead of it than a buffer" {
+    var device = Device.init(testing.allocator, .{ .backend = .alsa }) catch return error.SkipZigTest;
+    defer device.deinit();
+    try testing.expectEqual(types.Backend.alsa, device.info().backend);
+
+    // Four seconds of silence, so nothing is heard.
+    const silence = [_]i16{0} ** (44100 * 4);
+    const clip = try device.loadClip(.{ .format = .pcm_s16, .bytes = std.mem.sliceAsBytes(&silence), .channels = 1 });
+    const voice = try device.play(clip, .{});
+    try std.Io.sleep(testing.io, .fromMilliseconds(300), .awake);
+    const status = device.status(voice);
+    try testing.expect(status.playing);
+    try testing.expect(status.position > 0.1 and status.position < 1);
+    device.stop(voice);
 }

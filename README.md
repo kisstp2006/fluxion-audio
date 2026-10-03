@@ -65,7 +65,10 @@ plays out, and says so, in its own time.
 **ALSA is opened, not linked.** The `alsa` backend loads `libasound.so.2`
 when its first output opens, so a Linux build needs neither its headers nor
 the library - it cross-compiles from any machine - and a machine without it
-opens no output, the way one without a sound card does.
+opens no output, the way one without a sound card does. Its output keeps
+time with the device, and with the clock where the device does not: the null
+device takes any amount of sound at once, and the mix still goes no further
+ahead of what would be heard than a buffer, so voices end when they should.
 
 **Choosing a backend without the enum.** `Device.init` picks from the backends
 above. A program that wants to decide some other way - by name, from a

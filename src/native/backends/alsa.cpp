@@ -2,8 +2,10 @@
 
 #include "alsa.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <dlfcn.h>
 #include <memory>
 #include <thread>
@@ -32,7 +34,8 @@ namespace
         int (*pcm_open)(snd_pcm_t **, const char *, int, int);
         int (*pcm_close)(snd_pcm_t *);
         int (*pcm_prepare)(snd_pcm_t *);
-        int (*pcm_reset)(snd_pcm_t *);
+        int (*pcm_recover)(snd_pcm_t *, int, int);
+        int (*pcm_wait)(snd_pcm_t *, int);
         snd_pcm_sframes_t (*pcm_avail_update)(snd_pcm_t *);
         snd_pcm_sframes_t (*pcm_writei)(snd_pcm_t *, const void *, snd_pcm_uframes_t);
         int (*hw_params_malloc)(snd_pcm_hw_params_t **);
@@ -47,6 +50,7 @@ namespace
         int (*hw_params_set_period_time_near)(snd_pcm_t *, snd_pcm_hw_params_t *, unsigned int *, int *);
         int (*hw_params_get_period_size)(const snd_pcm_hw_params_t *, snd_pcm_uframes_t *, int *);
         int (*hw_params_get_periods)(const snd_pcm_hw_params_t *, unsigned int *, int *);
+        int (*hw_params_get_buffer_size)(const snd_pcm_hw_params_t *, snd_pcm_uframes_t *);
         int (*hw_params)(snd_pcm_t *, snd_pcm_hw_params_t *);
         int (*sw_params_malloc)(snd_pcm_sw_params_t **);
         void (*sw_params_free)(snd_pcm_sw_params_t *);
@@ -75,7 +79,8 @@ namespace
                 find(library, "snd_pcm_open", a.pcm_open) &&
                 find(library, "snd_pcm_close", a.pcm_close) &&
                 find(library, "snd_pcm_prepare", a.pcm_prepare) &&
-                find(library, "snd_pcm_reset", a.pcm_reset) &&
+                find(library, "snd_pcm_recover", a.pcm_recover) &&
+                find(library, "snd_pcm_wait", a.pcm_wait) &&
                 find(library, "snd_pcm_avail_update", a.pcm_avail_update) &&
                 find(library, "snd_pcm_writei", a.pcm_writei) &&
                 find(library, "snd_pcm_hw_params_malloc", a.hw_params_malloc) &&
@@ -90,6 +95,7 @@ namespace
                 find(library, "snd_pcm_hw_params_set_period_time_near", a.hw_params_set_period_time_near) &&
                 find(library, "snd_pcm_hw_params_get_period_size", a.hw_params_get_period_size) &&
                 find(library, "snd_pcm_hw_params_get_periods", a.hw_params_get_periods) &&
+                find(library, "snd_pcm_hw_params_get_buffer_size", a.hw_params_get_buffer_size) &&
                 find(library, "snd_pcm_hw_params", a.hw_params) &&
                 find(library, "snd_pcm_sw_params_malloc", a.sw_params_malloc) &&
                 find(library, "snd_pcm_sw_params_free", a.sw_params_free) &&
@@ -121,6 +127,7 @@ namespace fluxion_audio::alsa
         bool is_float = true;
         unsigned int periods = 4;
         snd_pcm_uframes_t period_size = 1024;
+        snd_pcm_uframes_t buffer_size = 4096;
 
         std::vector<float> planar;
         std::vector<std::uint8_t> interleaved;
@@ -134,6 +141,7 @@ namespace fluxion_audio::alsa
         }
 
         void run();
+        bool write(std::uint32_t frame_count);
     };
 
     namespace
@@ -218,12 +226,16 @@ namespace fluxion_audio::alsa
 
         if (api->hw_params(output->playback_handle, hw.params) != 0)
             return nullptr;
+        if (api->hw_params_get_buffer_size(hw.params, &output->buffer_size) != 0)
+            output->buffer_size = output->periods * output->period_size;
 
         SwParams sw{api};
         if (api->sw_params_malloc(&sw.params) != 0) return nullptr;
         if (api->sw_params_current(output->playback_handle, sw.params) != 0)
             return nullptr;
-        api->sw_params_set_avail_min(output->playback_handle, sw.params, 4096);
+        // Woken as soon as a period has room: 4096 frames was the whole
+        // buffer, so a device that made the thread wait let it run dry.
+        api->sw_params_set_avail_min(output->playback_handle, sw.params, output->period_size);
         api->sw_params_set_start_threshold(output->playback_handle, sw.params, 0);
         if (api->sw_params(output->playback_handle, sw.params) != 0)
             return nullptr;
@@ -247,29 +259,47 @@ namespace fluxion_audio::alsa
         delete output;
     }
 
+    // Mixed sound goes no further ahead of what has been heard than the
+    // device's buffer. A device that keeps time - a sound card, a sound
+    // server - makes this thread wait when it is full, and that wait is the
+    // clock. One that never fills - the null device takes any amount at once
+    // - would let the mixer race through its clips, every voice ending in an
+    // instant; the steady clock keeps it to time instead.
     void Output::run()
     {
+        using clock = std::chrono::steady_clock;
+        const int wait_ms = std::max(1, static_cast<int>(period_size * 2000 / sample_rate));
+        // Frames written since `since`, when the device last kept time.
+        auto since = clock::now();
+        std::uint64_t written = 0;
+
         while (running)
         {
-            snd_pcm_sframes_t frames = api->pcm_avail_update(playback_handle);
-            if (frames < 0)
+            const snd_pcm_sframes_t avail = api->pcm_avail_update(playback_handle);
+            if (avail < 0)
             {
-                if (frames == -EPIPE)
-                {
-                    api->pcm_prepare(playback_handle);
-                    continue;
-                }
-                break;
-            }
-            if (static_cast<snd_pcm_uframes_t>(frames) > periods * period_size)
-            {
-                api->pcm_reset(playback_handle);
+                if (api->pcm_recover(playback_handle, static_cast<int>(avail), 1) < 0) break;
                 continue;
             }
-            if (static_cast<snd_pcm_uframes_t>(frames) < period_size)
+            if (static_cast<snd_pcm_uframes_t>(avail) < period_size)
+            {
+                // Full: what is queued is all that is ahead of the ear.
+                since = clock::now();
+                written = buffer_size - std::min(buffer_size, static_cast<snd_pcm_uframes_t>(avail));
+                api->pcm_wait(playback_handle, wait_ms);
                 continue;
+            }
 
-            const auto frame_count = static_cast<std::uint32_t>(frames);
+            const double heard = std::chrono::duration<double>(clock::now() - since).count() * sample_rate;
+            const double room = heard + static_cast<double>(buffer_size) - static_cast<double>(written);
+            if (room < static_cast<double>(period_size))
+            {
+                const double short_by = static_cast<double>(period_size) - room;
+                std::this_thread::sleep_for(std::chrono::duration<double>(short_by / sample_rate));
+                continue;
+            }
+
+            const auto frame_count = static_cast<std::uint32_t>(std::min(static_cast<double>(avail), room));
             planar.resize(static_cast<std::size_t>(frame_count) * channels);
             pull(mixer, frame_count, channels, sample_rate, planar.data());
 
@@ -294,10 +324,30 @@ namespace fluxion_audio::alsa
                     }
             }
 
-            const auto result = api->pcm_writei(playback_handle, interleaved.data(), frames);
-            if (result == -EPIPE)
-                api->pcm_prepare(playback_handle);
+            if (!write(frame_count)) break;
+            written += frame_count;
         }
+    }
+
+    // All of `frame_count` frames, waiting for room as the device plays:
+    // what the mixer gave is never dropped, or its voices would run ahead of
+    // what is heard. False when the device cannot go on.
+    bool Output::write(std::uint32_t frame_count)
+    {
+        const std::size_t frame_bytes = static_cast<std::size_t>(channels) * (is_float ? sizeof(float) : sizeof(std::int16_t));
+        const int wait_ms = std::max(1, static_cast<int>(period_size * 2000 / sample_rate));
+        std::uint32_t done = 0;
+        while (done < frame_count && running)
+        {
+            const snd_pcm_sframes_t result = api->pcm_writei(playback_handle, interleaved.data() + done * frame_bytes, frame_count - done);
+            if (result >= 0)
+                done += static_cast<std::uint32_t>(result);
+            else if (result == -EAGAIN)
+                api->pcm_wait(playback_handle, wait_ms);
+            else if (api->pcm_recover(playback_handle, static_cast<int>(result), 1) < 0)
+                return false;
+        }
+        return true;
     }
 }
 
