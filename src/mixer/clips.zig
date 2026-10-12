@@ -429,3 +429,17 @@ pub const Mp3Reader = struct {
         return true;
     }
 };
+
+test "an Ogg Vorbis clip is read whatever its pages' checksums are: one with its top bit set too" {
+    // A twentieth of a second of a tone, whose last page's checksum has
+    // its top bit set: stb_vorbis puts the checksum together a byte at a
+    // time, shifting the top one into the sign of an int, which a build
+    // with its checks on stopped at - half of every game's sounds.
+    const bytes = @embedFile("testdata/tone.ogg");
+    try std.testing.expect(bytes[std.mem.lastIndexOf(u8, bytes, "OggS").? + 25] >= 0x80);
+    const data = try Data.initVorbis(std.testing.allocator, bytes);
+    defer data.destroy(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 1), data.channels);
+    try std.testing.expectEqual(@as(u32, 22050), data.sample_rate);
+    try std.testing.expect(data.frames() > 1000 and data.frames() < 1200);
+}

@@ -31,8 +31,13 @@ pub fn build(b: *std.Build) void {
 
     // The two decoders the mixer reads compressed clips with, as C - the
     // mixer itself is Zig (`src/mixer`), on every target, the browser too.
+    //
+    // Built without the checks a safe build puts into C: both decoders put
+    // numbers together a byte at a time, shifting a byte into the sign of an
+    // int, which is right on every target and stops such a build - an Ogg
+    // page whose checksum has its top bit set, half of all there are.
     mod.addIncludePath(b.path("src/native"));
-    mod.addCSourceFiles(.{ .files = &.{ "src/native/vorbis.c", "src/native/mp3.c" } });
+    mod.addCSourceFiles(.{ .files = &.{ "src/native/vorbis.c", "src/native/mp3.c" }, .flags = &.{"-fno-sanitize=undefined"} });
 
     // The `wasapi` backend's COM calls - a base OS component on every
     // Windows install, so this is a plain link rather than the dynamic
